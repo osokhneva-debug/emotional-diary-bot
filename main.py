@@ -10,7 +10,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden
-from sqlalchemy import text  # Добавлен импорт для SQLAlchemy 2.0
+from sqlalchemy import text
 
 from db import init_db, User, Entry, Schedule, UserSettings, get_session
 from scheduler import EmotionScheduler
@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Bot configuration - ИСПРАВЛЕНО: добавлена проверка токена
+# Bot configuration
 BOT_TOKEN = os.getenv('BOT_TOKEN') or os.getenv('TELEGRAM_BOT_TOKEN')
 if not BOT_TOKEN:
     raise ValueError("Bot token not found. Set BOT_TOKEN or TELEGRAM_BOT_TOKEN environment variable")
@@ -43,7 +43,11 @@ class EmotionalDiaryBot:
         
     async def setup(self):
         """Initialize bot application"""
+        # ИСПРАВЛЕНО: Создаем Application и инициализируем его
         self.app = Application.builder().token(BOT_TOKEN).build()
+        
+        # ВАЖНО: Инициализируем Application
+        await self.app.initialize()
         
         # Command handlers
         self.app.add_handler(CommandHandler("start", self.start_command))
@@ -628,6 +632,16 @@ class EmotionalDiaryBot:
         """Run bot with polling (for development)"""
         await self.setup()
         await self.app.run_polling(drop_pending_updates=True)
+    
+    async def shutdown(self):
+        """Shutdown bot properly"""
+        try:
+            if self.scheduler:
+                await self.scheduler.stop()
+            if self.app:
+                await self.app.shutdown()
+        except Exception as e:
+            logger.error(f"Error during shutdown: {e}")
 
 # Health check endpoint for monitoring
 from aiohttp import web, web_runner
@@ -636,8 +650,7 @@ import aiohttp_cors
 async def health_check(request):
     """Health check endpoint"""
     try:
-        # Check database connection - ИСПРАВЛЕНО для SQLAlchemy 2.0
-        from sqlalchemy import text
+        # Check database connection
         with get_session() as session:
             session.execute(text("SELECT 1"))
         
@@ -685,7 +698,7 @@ async def setup_web_server():
         )
     })
     
-    # Add routes - ИСПРАВЛЕНО: правильные пути
+    # Add routes
     app.router.add_get('/', lambda r: web.Response(text="Emotional Diary Bot is running"))
     app.router.add_get('/health', health_check)
     app.router.add_post('/webhook', webhook_handler)
@@ -696,43 +709,49 @@ async def setup_web_server():
     
     return app
 
-# Main execution - ИСПРАВЛЕНО: убрана проблема с дублированием webhook
+# Main execution
 if __name__ == "__main__":
     bot = EmotionalDiaryBot()
     
     if WEBHOOK_URL:
         async def main():
-            # Setup bot
-            await bot.setup()
-            
-            # Setup web server
-            web_app = await setup_web_server()
-            runner = web_runner.AppRunner(web_app)
-            await runner.setup()
-            
-            site = web_runner.TCPSite(runner, '0.0.0.0', PORT)
-            await site.start()
-            
-            # Set webhook - ИСПРАВЛЕНО: правильный URL без дублирования
-            webhook_url = f"{WEBHOOK_URL}/webhook"
-            await bot.app.bot.set_webhook(
-                url=webhook_url,
-                drop_pending_updates=True
-            )
-            
-            logger.info(f"Bot started with webhook on port {PORT}")
-            logger.info(f"Webhook URL set to: {webhook_url}")
-            logger.info(f"Health check available at: {WEBHOOK_URL}/health")
-            logger.info(f"Root endpoint available at: {WEBHOOK_URL}/")
-            
-            # Keep running
             try:
-                while True:
-                    await asyncio.sleep(1)
-            except KeyboardInterrupt:
-                logger.info("Shutting down...")
-                await bot.scheduler.stop()
-                await runner.cleanup()
+                # Setup bot
+                await bot.setup()
+                
+                # Setup web server
+                web_app = await setup_web_server()
+                runner = web_runner.AppRunner(web_app)
+                await runner.setup()
+                
+                site = web_runner.TCPSite(runner, '0.0.0.0', PORT)
+                await site.start()
+                
+                # Set webhook
+                webhook_url = f"{WEBHOOK_URL}/webhook"
+                await bot.app.bot.set_webhook(
+                    url=webhook_url,
+                    drop_pending_updates=True
+                )
+                
+                logger.info(f"Bot started with webhook on port {PORT}")
+                logger.info(f"Webhook URL set to: {webhook_url}")
+                logger.info(f"Health check available at: {WEBHOOK_URL}/health")
+                logger.info(f"Root endpoint available at: {WEBHOOK_URL}/")
+                
+                # Keep running
+                try:
+                    while True:
+                        await asyncio.sleep(1)
+                except KeyboardInterrupt:
+                    logger.info("Shutting down...")
+                    await bot.shutdown()
+                    await runner.cleanup()
+                    
+            except Exception as e:
+                logger.error(f"Error in main: {e}")
+                await bot.shutdown()
+                raise
         
         asyncio.run(main())
     else:
