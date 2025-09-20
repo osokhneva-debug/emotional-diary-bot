@@ -16,7 +16,7 @@ from db import init_db, User, Entry, Schedule, UserSettings, get_session
 from scheduler import EmotionScheduler
 from analysis import EmotionAnalyzer
 from i18n import TEXTS, EMOTION_CATEGORIES
-from security import sanitize_input, RateLimiter
+from security import sanitize_input
 from rate_limiter import rate_limit, rate_limit_emotion_entry, rate_limit_summary, rate_limit_export
 
 # Configure logging
@@ -45,11 +45,10 @@ class EmotionalDiaryBot:
         self.app = None
         self.scheduler = EmotionScheduler()
         self.analyzer = EmotionAnalyzer()
-        self.rate_limiter = RateLimiter()
         
     async def setup(self):
         """Initialize bot application"""
-        # ИСПРАВЛЕНО: Создаем Application и инициализируем его
+        # Создаем Application и инициализируем его
         self.app = Application.builder().token(BOT_TOKEN).build()
         
         # ВАЖНО: Инициализируем Application
@@ -126,8 +125,9 @@ class EmotionalDiaryBot:
                 )
                 
             else:
+                name = f" {user.first_name}" if user.first_name else ""
                 await update.message.reply_text(
-                    TEXTS['welcome_back'].format(name=user.first_name or ""),
+                    TEXTS['welcome_back'].format(name=name),
                     parse_mode=ParseMode.HTML
                 )
 
@@ -345,8 +345,14 @@ class EmotionalDiaryBot:
             ]
         ])
         
+        valence_text = {
+            'positive': TEXTS['valence_positive'],
+            'negative': TEXTS['valence_negative'],
+            'neutral': TEXTS['valence_neutral']
+        }
+        
         await query.edit_message_text(
-            f"{TEXTS['selected_valence']} <b>{TEXTS[f'valence_{valence}']}</b>\n\n{TEXTS['rate_arousal']}",
+            f"{TEXTS['selected_valence']} <b>{valence_text[valence]}</b>\n\n{TEXTS['rate_arousal']}",
             reply_markup=keyboard,
             parse_mode=ParseMode.HTML
         )
@@ -363,8 +369,14 @@ class EmotionalDiaryBot:
             [InlineKeyboardButton(TEXTS['skip_cause_btn'], callback_data="skip_cause")]
         ])
         
+        arousal_text = {
+            'high': TEXTS['arousal_high'],
+            'medium': TEXTS['arousal_medium'],
+            'low': TEXTS['arousal_low']
+        }
+        
         await query.edit_message_text(
-            f"{TEXTS['selected_arousal']} <b>{TEXTS[f'arousal_{arousal}']}</b>\n\n{TEXTS['ask_cause']}",
+            f"{TEXTS['selected_arousal']} <b>{arousal_text[arousal]}</b>\n\n{TEXTS['ask_cause']}",
             reply_markup=keyboard,
             parse_mode=ParseMode.HTML
         )
@@ -684,6 +696,10 @@ async def health_check(request):
             status=500
         )
 
+async def root_handler(request):
+    """Root endpoint handler"""
+    return web.Response(text="Emotional Diary Bot is running! 🌸")
+
 async def webhook_handler(request):
     """Handle incoming webhooks"""
     try:
@@ -721,7 +737,7 @@ async def setup_web_server():
     })
     
     # Add routes
-    app.router.add_get('/', lambda r: web.Response(text="Emotional Diary Bot is running"))
+    app.router.add_get('/', root_handler)
     app.router.add_get('/health', health_check)
     app.router.add_post('/webhook', webhook_handler)
     
@@ -731,9 +747,11 @@ async def setup_web_server():
     
     return app
 
+# Global bot instance
+bot = EmotionalDiaryBot()
+
 # Main execution
 if __name__ == "__main__":
-    bot = EmotionalDiaryBot()
     
     if WEBHOOK_URL:
         async def main():
