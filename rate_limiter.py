@@ -3,7 +3,6 @@ import logging
 import functools
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
-from typing import Dict, Any
 
 logger = logging.getLogger('rate_limiter')
 
@@ -24,16 +23,7 @@ class RateLimiter:
         }
     
     def is_allowed(self, user_id: int, action_type: str = 'general_command') -> bool:
-        """
-        Check if user is allowed to perform action
-        
-        Args:
-            user_id: User identifier
-            action_type: Type of action to check
-            
-        Returns:
-            True if allowed, False if rate limited
-        """
+        """Check if user is allowed to perform action"""
         try:
             if action_type not in self.limits:
                 action_type = 'general_command'
@@ -68,45 +58,42 @@ class RateLimiter:
 global_rate_limiter = RateLimiter()
 
 def rate_limit(action_type: str = 'general_command'):
-    """
-    Decorator for rate limiting functions
-    
-    Args:
-        action_type: Type of action for rate limiting
-    """
+    """Decorator for rate limiting functions"""
     def decorator(func):
         @functools.wraps(func)
-        async def wrapper(self, update, context, *args, **kwargs):
+        async def wrapper(*args, **kwargs):
+            # args[0] = self, args[1] = update, args[2] = context
             try:
-                # Получаем user_id из update
-                user_id = None
-                if hasattr(update, 'effective_user') and update.effective_user:
-                    user_id = update.effective_user.id
-                elif hasattr(update, 'message') and update.message and update.message.from_user:
-                    user_id = update.message.from_user.id
-                
-                if user_id is None:
-                    logger.error("Could not get user_id for rate limiting")
-                    return await func(self, update, context, *args, **kwargs)
-                
-                # Проверяем лимит
-                if not global_rate_limiter.is_allowed(user_id, action_type):
-                    logger.warning(f"Rate limit exceeded for user {user_id}, action {action_type}")
+                if len(args) >= 2:
+                    update = args[1]
+                    user_id = None
                     
-                    # Отправляем сообщение о превышении лимита
-                    if hasattr(update, 'message') and update.message:
-                        await update.message.reply_text(
-                            "⚠️ Слишком много запросов. Пожалуйста, подождите немного."
-                        )
-                    return
+                    # Get user_id from update
+                    if hasattr(update, 'effective_user') and update.effective_user:
+                        user_id = update.effective_user.id
+                    elif hasattr(update, 'message') and update.message and hasattr(update.message, 'from_user'):
+                        user_id = update.message.from_user.id
+                    
+                    if user_id and not global_rate_limiter.is_allowed(user_id, action_type):
+                        logger.warning(f"Rate limit exceeded for user {user_id}, action {action_type}")
+                        
+                        # Try to send rate limit message
+                        try:
+                            if hasattr(update, 'message') and update.message:
+                                await update.message.reply_text(
+                                    "⚠️ Слишком много запросов. Пожалуйста, подождите немного."
+                                )
+                        except:
+                            pass  # Ignore errors when sending rate limit message
+                        return
                 
-                # Выполняем функцию
-                return await func(self, update, context, *args, **kwargs)
+                # Execute function
+                return await func(*args, **kwargs)
                 
             except Exception as e:
                 logger.error(f"Error in rate limiter wrapper: {e}")
-                # В случае ошибки выполняем функцию без ограничений
-                return await func(self, update, context, *args, **kwargs)
+                # Execute function without rate limiting on error
+                return await func(*args, **kwargs)
         
         return wrapper
     return decorator
