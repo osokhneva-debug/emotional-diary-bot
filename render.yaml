@@ -23,11 +23,13 @@ services:
         value: INFO
       - key: PYTHON_VERSION
         value: 3.11.0
+      - key: PYTHONPATH
+        value: /opt/render/project/src
     
     # Disk for persistent SQLite database
     disk:
       name: emotional-diary-data
-      mountPath: /app/data
+      mountPath: /opt/render/project/src/data
       sizeGB: 1
 
 # Build settings
@@ -37,7 +39,7 @@ buildFilter:
   - requirements.txt
   - render.yaml
   
-# Health check settings - ИСПРАВЛЕНО
+# Health check settings
 healthCheck:
   path: /health
   port: 8080
