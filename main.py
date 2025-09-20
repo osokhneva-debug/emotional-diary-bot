@@ -658,6 +658,17 @@ async def health_check(request):
             status=500
         )
 
+async def webhook_handler(request):
+    """Handle incoming webhooks"""
+    try:
+        update_data = await request.json()
+        update = Update.de_json(update_data, bot.app.bot)
+        await bot.app.process_update(update)
+        return web.Response(text="OK")
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return web.Response(text="Error", status=500)
+
 async def setup_web_server():
     """Setup web server for webhooks and health checks"""
     app = web.Application()
@@ -672,7 +683,8 @@ async def setup_web_server():
         )
     })
     
-    # Add routes
+    # Add routes - ИСПРАВЛЕНО: правильные пути
+    app.router.add_get('/', lambda r: web.Response(text="Emotional Diary Bot is running"))
     app.router.add_get('/health', health_check)
     app.router.add_post('/webhook', webhook_handler)
     
@@ -681,17 +693,6 @@ async def setup_web_server():
         cors.add(route)
     
     return app
-
-async def webhook_handler(request):
-    """Handle incoming webhooks"""
-    try:
-        update_data = await request.json()
-        update = Update.de_json(update_data, bot.app.bot)
-        await bot.app.process_update(update)
-        return web.Response(text="OK")
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return web.Response(text="Error", status=500)
 
 # Main execution - ИСПРАВЛЕНО: убрана проблема с дублированием webhook
 if __name__ == "__main__":
@@ -719,7 +720,8 @@ if __name__ == "__main__":
             
             logger.info(f"Bot started with webhook on port {PORT}")
             logger.info(f"Webhook URL set to: {webhook_url}")
-            logger.info(f"Expecting requests at: /webhook")
+            logger.info(f"Health check available at: {WEBHOOK_URL}/health")
+            logger.info(f"Root endpoint available at: {WEBHOOK_URL}/")
             
             # Keep running
             try:
