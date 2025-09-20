@@ -623,24 +623,6 @@ class EmotionalDiaryBot:
         except (BadRequest, Forbidden) as e:
             logger.warning(f"Could not send weekly summary to {chat_id}: {e}")
 
-    async def run_webhook(self):
-        """Run bot with webhook"""
-        await self.setup()
-        
-        # Set webhook
-        await self.app.bot.set_webhook(
-            url=f"{WEBHOOK_URL}/webhook",
-            drop_pending_updates=True
-        )
-        
-        # Start webhook
-        await self.app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            webhook_url=f"{WEBHOOK_URL}/webhook",
-            drop_pending_updates=True
-        )
-
     async def run_polling(self):
         """Run bot with polling (for development)"""
         await self.setup()
@@ -711,7 +693,7 @@ async def webhook_handler(request):
         logger.error(f"Webhook error: {e}")
         return web.Response(text="Error", status=500)
 
-# Main execution
+# Main execution - ИСПРАВЛЕНО: убрана проблема с дублированием webhook
 if __name__ == "__main__":
     bot = EmotionalDiaryBot()
     
@@ -728,13 +710,16 @@ if __name__ == "__main__":
             site = web_runner.TCPSite(runner, '0.0.0.0', PORT)
             await site.start()
             
-            # Set webhook
+            # Set webhook - ИСПРАВЛЕНО: правильный URL без дублирования
+            webhook_url = f"{WEBHOOK_URL}/webhook"
             await bot.app.bot.set_webhook(
-                url=f"{WEBHOOK_URL}/webhook",
+                url=webhook_url,
                 drop_pending_updates=True
             )
             
             logger.info(f"Bot started with webhook on port {PORT}")
+            logger.info(f"Webhook URL set to: {webhook_url}")
+            logger.info(f"Expecting requests at: /webhook")
             
             # Keep running
             try:
@@ -747,4 +732,5 @@ if __name__ == "__main__":
         
         asyncio.run(main())
     else:
+        logger.info("No WEBHOOK_URL provided, running in polling mode")
         asyncio.run(bot.run_polling())
