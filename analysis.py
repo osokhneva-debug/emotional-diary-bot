@@ -95,7 +95,9 @@ class EmotionAnalyzer:
                 if count > 0 and group_key in emotion_details:
                     emotions_list = []
                     for emotion, freq in emotion_details[group_key].most_common(5):
-                        emotions_list.append(f'"{emotion}" ({freq})')
+                        # Экранируем HTML символы в названиях эмоций
+                        emotion_escaped = emotion.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                        emotions_list.append(f'"{emotion_escaped}" ({freq})')
                     if emotions_list:
                         summary_parts.append(", ".join(emotions_list))
                 
@@ -120,7 +122,9 @@ class EmotionAnalyzer:
                         
                         summary_parts.append(f"<b>{trigger_title}</b>")
                         for trigger in triggers[:3]:  # Показываем только топ-3
-                            summary_parts.append(f"• {trigger}")
+                            # Экранируем HTML символы в триггерах
+                            trigger_escaped = trigger.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                            summary_parts.append(f"• {trigger_escaped}")
                         summary_parts.append("")
             
             # Time patterns
