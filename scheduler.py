@@ -1,7 +1,7 @@
 # scheduler.py
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone  # ИСПРАВЛЕНО: добавлен timedelta
 from typing import List, Callable
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
