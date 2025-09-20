@@ -1,0 +1,40 @@
+services:
+  - type: web
+    name: emotional-diary-bot
+    env: python
+    plan: starter  # Free tier
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    
+    # Environment variables (set these in Render dashboard)
+    envVars:
+      - key: BOT_TOKEN
+        sync: false  # Set manually in dashboard
+      - key: WEBHOOK_URL
+        sync: false  # Set to your render app URL
+      - key: DATABASE_URL
+        value: sqlite:///./data/emotional_diary.db
+      - key: PORT
+        value: 8080
+      - key: PYTHON_VERSION
+        value: 3.11.0
+    
+    # Disk for persistent SQLite database
+    disk:
+      name: emotional-diary-data
+      mountPath: /app/data
+      sizeGB: 1
+
+# Build settings
+buildFilter:
+  paths:
+  - app/**
+  - requirements.txt
+  - main.py
+  - Dockerfile
+  
+# Health check settings
+healthCheck:
+  path: /health
+  port: 8080
