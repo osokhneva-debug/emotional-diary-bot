@@ -25,8 +25,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Bot configuration
-BOT_TOKEN = os.getenv('BOT_TOKEN')
+# Bot configuration - ИСПРАВЛЕНО: добавлена проверка токена
+BOT_TOKEN = os.getenv('BOT_TOKEN') or os.getenv('TELEGRAM_BOT_TOKEN')
+if not BOT_TOKEN:
+    raise ValueError("Bot token not found. Set BOT_TOKEN or TELEGRAM_BOT_TOKEN environment variable")
+
 WEBHOOK_URL = os.getenv('WEBHOOK_URL')
 PORT = int(os.getenv('PORT', 8080))
 
