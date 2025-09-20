@@ -113,7 +113,7 @@ class RateLimiter:
 # Global rate limiter instance
 global_rate_limiter = RateLimiter()
 
-def rate_limit(action_type: str = 'general_command', error_message: Optional[str] = None):
+def rate_limit(func: Callable = None, *, action_type: str = 'general_command', error_message: Optional[str] = None):
     """
     Decorator for rate limiting telegram bot handlers
     
@@ -125,7 +125,7 @@ def rate_limit(action_type: str = 'general_command', error_message: Optional[str
         @functools.wraps(func)
         async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
             try:
-                # Get user ID
+                # Get user ID safely
                 user_id = update.effective_user.id if update.effective_user else 0
                 
                 # Check rate limit
@@ -152,24 +152,29 @@ def rate_limit(action_type: str = 'general_command', error_message: Optional[str
                 return await func(update, context, *args, **kwargs)
         
         return wrapper
-    return decorator
+    
+    # Handle both @rate_limit and @rate_limit() syntax
+    if func is None:
+        return decorator
+    else:
+        return decorator(func)
 
 # Specific decorators for different action types
 def rate_limit_emotion_entry(func: Callable):
     """Rate limit for emotion entry actions"""
-    return rate_limit('emotion_entry', "Слишком много записей эмоций. Попробуйте через некоторое время.")(func)
+    return rate_limit(func, action_type='emotion_entry', error_message="Слишком много записей эмоций. Попробуйте через некоторое время.")
 
 def rate_limit_summary(func: Callable):
     """Rate limit for summary requests"""
-    return rate_limit('summary_request', "Слишком много запросов сводок. Подождите немного.")(func)
+    return rate_limit(func, action_type='summary_request', error_message="Слишком много запросов сводок. Подождите немного.")
 
 def rate_limit_export(func: Callable):
     """Rate limit for export requests"""
-    return rate_limit('export_request', "Лимит экспорта превышен. Попробуйте позже.")(func)
+    return rate_limit(func, action_type='export_request', error_message="Лимит экспорта превышен. Попробуйте позже.")
 
 def rate_limit_message(func: Callable):
     """Rate limit for general messages"""
-    return rate_limit('message', "Слишком много сообщений. Сделайте паузу.")(func)
+    return rate_limit(func, action_type='message', error_message="Слишком много сообщений. Сделайте паузу.")
 
 async def check_user_quotas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
