@@ -16,7 +16,7 @@ from scheduler import EmotionScheduler
 from analysis import EmotionAnalyzer
 from i18n import TEXTS, EMOTION_CATEGORIES
 from security import sanitize_input, RateLimiter
-from rate_limiter import rate_limit
+from rate_limiter import rate_limit, rate_limit_emotion_entry, rate_limit_summary, rate_limit_export
 
 # Configure logging
 logging.basicConfig(
@@ -60,6 +60,13 @@ class EmotionalDiaryBot:
         
         # Initialize database and scheduler
         await init_db()
+        
+        # Set scheduler callbacks
+        self.scheduler.set_callbacks(
+            self.send_daily_ping,
+            self.send_weekly_summary
+        )
+        
         await self.scheduler.start()
         
         logger.info("Bot setup completed")
@@ -105,7 +112,7 @@ class EmotionalDiaryBot:
                     parse_mode=ParseMode.HTML
                 )
 
-    @rate_limit
+    @rate_limit_emotion_entry
     async def note_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /note command - start emotion logging process"""
         chat_id = update.effective_chat.id
@@ -124,7 +131,7 @@ class EmotionalDiaryBot:
             parse_mode=ParseMode.HTML
         )
 
-    @rate_limit
+    @rate_limit_summary
     async def summary_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /summary command"""
         chat_id = update.effective_chat.id
@@ -141,7 +148,7 @@ class EmotionalDiaryBot:
             reply_markup=keyboard
         )
 
-    @rate_limit
+    @rate_limit_export
     async def export_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /export command"""
         chat_id = update.effective_chat.id
@@ -636,17 +643,105 @@ class EmotionalDiaryBot:
         await self.setup()
         await self.app.run_polling(drop_pending_updates=True)
 
-# Health check endpoint
-from aiohttp import web
+# Health check endpoint for monitoring
+from aiohttp import web, web_runner
+import aiohttp_cors
 
 async def health_check(request):
-    return web.Response(text="OK", status=200)
+    """Health check endpoint"""
+    try:
+        # Check database connection
+        with get_session() as session:
+            session.execute("SELECT 1")
+        
+        # Check scheduler status  
+        scheduler_running = hasattr(bot, 'scheduler') and bot.scheduler.scheduler.running
+        
+        health_data = {
+            "status": "healthy",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "database": "connected",
+            "scheduler": "running" if scheduler_running else "stopped",
+            "version": "1.0.0"
+        }
+        
+        return web.json_response(health_data)
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return web.json_response(
+            {"status": "unhealthy", "error": str(e)},
+            status=500
+        )
+
+async def setup_web_server():
+    """Setup web server for webhooks and health checks"""
+    app = web.Application()
+    
+    # Setup CORS
+    cors = aiohttp_cors.setup(app, defaults={
+        "*": aiohttp_cors.ResourceOptions(
+            allow_credentials=True,
+            expose_headers="*",
+            allow_headers="*",
+            allow_methods="*"
+        )
+    })
+    
+    # Add routes
+    app.router.add_get('/health', health_check)
+    app.router.add_post('/webhook', webhook_handler)
+    
+    # Add CORS to all routes
+    for route in list(app.router.routes()):
+        cors.add(route)
+    
+    return app
+
+async def webhook_handler(request):
+    """Handle incoming webhooks"""
+    try:
+        update_data = await request.json()
+        update = Update.de_json(update_data, bot.app.bot)
+        await bot.app.process_update(update)
+        return web.Response(text="OK")
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return web.Response(text="Error", status=500)
 
 # Main execution
 if __name__ == "__main__":
     bot = EmotionalDiaryBot()
     
     if WEBHOOK_URL:
-        asyncio.run(bot.run_webhook())
+        async def main():
+            # Setup bot
+            await bot.setup()
+            
+            # Setup web server
+            web_app = await setup_web_server()
+            runner = web_runner.AppRunner(web_app)
+            await runner.setup()
+            
+            site = web_runner.TCPSite(runner, '0.0.0.0', PORT)
+            await site.start()
+            
+            # Set webhook
+            await bot.app.bot.set_webhook(
+                url=f"{WEBHOOK_URL}/webhook",
+                drop_pending_updates=True
+            )
+            
+            logger.info(f"Bot started with webhook on port {PORT}")
+            
+            # Keep running
+            try:
+                while True:
+                    await asyncio.sleep(1)
+            except KeyboardInterrupt:
+                logger.info("Shutting down...")
+                await bot.scheduler.stop()
+                await runner.cleanup()
+        
+        asyncio.run(main())
     else:
         asyncio.run(bot.run_polling())
