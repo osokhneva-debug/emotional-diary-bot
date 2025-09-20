@@ -1,356 +1,476 @@
-# security.py
-import re
-import html
+# analysis.py
+import json
+import csv
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Optional
+from collections import Counter, defaultdict
+import io
 import logging
-from typing import Optional
-import bleach
-from datetime import datetime, timedelta
-from collections import defaultdict, deque
+
+from db import get_session, User, Entry
+from i18n import TEXTS, EMOTION_CATEGORIES
 
 logger = logging.getLogger(__name__)
 
-def sanitize_input(text: str, max_length: int = 1000) -> str:
-    """
-    Sanitize user input to prevent injection attacks and limit length
-    
-    Args:
-        text: Input text to sanitize
-        max_length: Maximum allowed length
-        
-    Returns:
-        Sanitized and truncated text
-    """
-    if not text:
-        return ""
-    
-    # Remove excessive whitespace
-    text = re.sub(r'\s+', ' ', text.strip())
-    
-    # Limit length
-    if len(text) > max_length:
-        text = text[:max_length] + "..."
-    
-    # HTML escape to prevent injection
-    text = html.escape(text)
-    
-    # Remove potentially malicious patterns
-    # Remove script tags and similar
-    text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.IGNORECASE | re.DOTALL)
-    text = re.sub(r'javascript:', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'on\w+\s*=', '', text, flags=re.IGNORECASE)
-    
-    # Remove excessive special characters that might be used for injection
-    text = re.sub(r'[<>"\'{};]', '', text)
-    
-    # Remove null bytes and control characters except newlines and tabs
-    text = ''.join(char for char in text if ord(char) >= 32 or char in '\n\t')
-    
-    return text
-
-def validate_emotion_data(emotions: list, category: str, valence: float, arousal: float) -> bool:
-    """
-    Validate emotion entry data
-    
-    Args:
-        emotions: List of emotion strings
-        category: Emotion category
-        valence: Valence value (-1 to 1)
-        arousal: Arousal value (0 to 2)
-        
-    Returns:
-        True if data is valid, False otherwise
-    """
-    try:
-        # Check emotions list
-        if not isinstance(emotions, list) or len(emotions) == 0:
-            return False
-        
-        if len(emotions) > 10:  # Max 10 emotions per entry
-            return False
-        
-        for emotion in emotions:
-            if not isinstance(emotion, str) or len(emotion) > 50:
-                return False
-        
-        # Check category
-        if not isinstance(category, str) or len(category) > 100:
-            return False
-        
-        # Check valence range
-        if not isinstance(valence, (int, float)) or not (-1 <= valence <= 1):
-            return False
-        
-        # Check arousal range
-        if not isinstance(arousal, (int, float)) or not (0 <= arousal <= 2):
-            return False
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error validating emotion data: {e}")
-        return False
-
-def validate_timezone(timezone_str: str) -> bool:
-    """
-    Validate timezone string
-    
-    Args:
-        timezone_str: Timezone string to validate
-        
-    Returns:
-        True if valid timezone, False otherwise
-    """
-    try:
-        import pytz
-        return timezone_str in pytz.all_timezones
-    except Exception:
-        return False
-
-def validate_time_format(time_str: str) -> bool:
-    """
-    Validate time format (HH:MM)
-    
-    Args:
-        time_str: Time string to validate
-        
-    Returns:
-        True if valid format, False otherwise
-    """
-    try:
-        pattern = r'^([01]?[0-9]|2[0-3]):[0-5][0-9]$'
-        return bool(re.match(pattern, time_str))
-    except Exception:
-        return False
-
-class RateLimiter:
-    """Rate limiter to prevent spam and abuse"""
+class EmotionAnalyzer:
+    """Analyzes emotional data and generates insights"""
     
     def __init__(self):
-        # Store request timestamps for each user
-        self.user_requests = defaultdict(lambda: deque())
-        
-        # Rate limits (requests per time window)
-        self.limits = {
-            'emotion_entry': {'count': 50, 'window': 3600},    # 50 entries per hour
-            'summary_request': {'count': 20, 'window': 3600},   # 20 summaries per hour
-            'export_request': {'count': 5, 'window': 3600},     # 5 exports per hour
-            'general_command': {'count': 100, 'window': 3600},  # 100 commands per hour
-            'message': {'count': 200, 'window': 3600}           # 200 messages per hour
+        # Группировка эмоций на основе научных исследований
+        self.emotion_groups = {
+            'recovery_growth': {
+                'name': '🌱 Эмоции восстановления и роста',
+                'keywords': [
+                    # Радость/Удовлетворение
+                    'радость', 'счастье', 'восторг', 'благодарность', 'вдохновение', 'гордость', 'удовлетворение', 'блаженство',
+                    # Интерес/Любопытство  
+                    'интерес', 'любопытство', 'увлечённость', 'предвкушение', 'азарт', 'заинтересованность', 'любознательность',
+                    # Спокойствие/Умиротворение
+                    'спокойствие', 'расслабленность', 'гармония', 'принятие', 'безопасность', 'умиротворение', 'безмятежность', 'равновесие',
+                    # Энергичность/Воодушевление
+                    'бодрость', 'энтузиазм', 'возбуждение', 'решимость', 'драйв', 'воодушевление', 'подъём', 'энергия'
+                ],
+                'description': 'Эмоции, способствующие развитию и восстановлению'
+            },
+            'tension_signal': {
+                'name': '🌪 Эмоции напряжения и сигнала',
+                'keywords': [
+                    # Тревога/Беспокойство
+                    'тревога', 'беспокойство', 'нервозность', 'страх', 'напряжение', 'сомнение', 'волнение', 'опасение',
+                    # Грусть/Печаль
+                    'грусть', 'печаль', 'тоска', 'разочарование', 'меланхолия', 'одиночество', 'горе', 'уныние', 'сожаление',
+                    # Злость/Раздражение
+                    'злость', 'раздражение', 'гнев', 'обида', 'фрустрация', 'зависть', 'возмущение', 'негодование',
+                    # Стыд/Вина
+                    'стыд', 'вина', 'смущение', 'неловкость', 'самокритика', 'угрызения', 'раскаяние',
+                    # Усталость/Истощение
+                    'усталость', 'истощение', 'апатия', 'выгорание', 'безразличие', 'вялость', 'изнеможение', 'опустошённость',
+                    # Удивление/Шок
+                    'удивление', 'изумление', 'ошеломление', 'растерянность', 'недоумение', 'потрясение', 'шок'
+                ],
+                'description': 'Эмоции, сигнализирующие о потребностях и вызовах'
+            },
+            'neutral': {
+                'name': '⚖ Нейтральные/прочие состояния',
+                'keywords': [
+                    'нейтрально', 'обычно', 'нормально', 'неопределенность', 'неясность', 'смешанность'
+                ],
+                'description': 'Сбалансированные и нейтральные состояния'
+            }
         }
     
-    def is_allowed(self, user_id: int, action_type: str = 'general_command') -> bool:
-        """
-        Check if user is allowed to perform action
-        
-        Args:
-            user_id: User identifier
-            action_type: Type of action to check
-            
-        Returns:
-            True if allowed, False if rate limited
-        """
+    async def generate_summary(self, user_id: int, period: str) -> str:
+        """Generate emotional summary for specified period"""
         try:
-            if action_type not in self.limits:
-                action_type = 'general_command'
+            # Parse period
+            days = self._parse_period(period)
+            if not days:
+                return TEXTS.get('invalid_period', 'Неверный период для анализа.')
             
-            limit_config = self.limits[action_type]
-            max_requests = limit_config['count']
-            time_window = limit_config['window']
+            # Get entries for the period
+            entries = self._get_entries_for_period(user_id, days)
             
-            now = datetime.now()
-            user_key = f"{user_id}_{action_type}"
+            if not entries:
+                period_name = {7: "неделю", 14: "2 недели", 30: "месяц", 90: "3 месяца"}.get(days, f"{days} дней")
+                return f"📭 За последние {days} дней нет записей эмоций.\n\nНачните отслеживать свои эмоции с помощью /note!"
             
-            # Clean old requests outside the time window
-            cutoff_time = now - timedelta(seconds=time_window)
-            requests_queue = self.user_requests[user_key]
+            # Generate comprehensive analysis
+            summary_parts = []
             
-            while requests_queue and requests_queue[0] < cutoff_time:
-                requests_queue.popleft()
+            # Header
+            period_name = {7: "неделю", 14: "2 недели", 30: "месяц", 90: "3 месяца"}.get(days, f"{days} дней")
+            summary_parts.append(f"📊 <b>Сводка за {period_name}</b>")
+            summary_parts.append("")
             
-            # Check if under limit
-            if len(requests_queue) >= max_requests:
-                return False
+            # Emotion groups analysis
+            group_analysis = self._analyze_emotion_groups(entries)
+            emotion_details = self._get_emotion_details_by_group(entries)
             
-            # Add current request
-            requests_queue.append(now)
-            return True
+            summary_parts.append("<b>🎭 Эмоции по группам:</b>")
+            summary_parts.append("")
+            
+            for group_key, group_data in self.emotion_groups.items():
+                count = group_analysis.get(group_key, 0)
+                group_name = group_data['name']
+                
+                summary_parts.append(f"<b>{group_name}:</b> {count} раз")
+                
+                # Добавляем детали эмоций для каждой группы
+                if count > 0 and group_key in emotion_details:
+                    emotions_list = []
+                    for emotion, freq in emotion_details[group_key].most_common(5):
+                        # Экранируем HTML символы в названиях эмоций
+                        emotion_escaped = self._escape_html(emotion)
+                        emotions_list.append(f'"{emotion_escaped}" ({freq})')
+                    if emotions_list:
+                        summary_parts.append(", ".join(emotions_list))
+                
+                summary_parts.append("")
+            
+            # Trigger analysis by groups
+            trigger_analysis = self._analyze_triggers_by_groups(entries)
+            if trigger_analysis:
+                summary_parts.append("<b>🔍 Что влияло на эмоции:</b>")
+                summary_parts.append("")
+                
+                for group_key, triggers in trigger_analysis.items():
+                    if triggers:
+                        group_name = self.emotion_groups[group_key]['name']
+                        # Сокращаем название для триггеров
+                        if 'восстановления и роста' in group_name:
+                            trigger_title = "🌱 Триггеры позитивных эмоций:"
+                        elif 'напряжения и сигнала' in group_name:
+                            trigger_title = "🌪 Триггеры напряженных эмоций:"
+                        else:
+                            trigger_title = "⚖ Триггеры нейтральных эмоций:"
+                        
+                        summary_parts.append(f"<b>{trigger_title}</b>")
+                        for trigger in triggers[:3]:  # Показываем только топ-3
+                            trigger_escaped = self._escape_html(trigger)
+                            summary_parts.append(f"• {trigger_escaped}")
+                        summary_parts.append("")
+            
+            # Time patterns
+            time_patterns = self._analyze_time_patterns(entries)
+            if time_patterns:
+                peak_hour = max(time_patterns.items(), key=lambda x: x[1])
+                time_of_day = self._get_time_of_day_name(peak_hour[0])
+                summary_parts.append(f"<b>⏰ Пик активности:</b> {peak_hour[0]}:00 ({time_of_day})")
+            
+            summary_parts.append(f"<b>📈 Всего записей:</b> {len(entries)}")
+            summary_parts.append("")
+            
+            # Add insights for working women
+            insights = self._generate_insights_for_working_women(entries, group_analysis)
+            if insights:
+                summary_parts.append("<b>💡 Персональные инсайты:</b>")
+                for insight in insights:
+                    summary_parts.append(f"• {insight}")
+                summary_parts.append("")
+            
+            # Footer
+            summary_parts.append("<i>Хочешь подробности? Используй /export для CSV-файла.</i>")
+            
+            return "\n".join(summary_parts)
             
         except Exception as e:
-            logger.error(f"Error in rate limiter: {e}")
-            return True  # Allow on error to avoid blocking legitimate users
+            logger.error(f"Error generating summary for user {user_id}: {e}")
+            return "Ошибка при генерации сводки. Попробуйте позже."
     
-    def get_remaining_quota(self, user_id: int, action_type: str = 'general_command') -> int:
-        """
-        Get remaining quota for user action
+    def _escape_html(self, text: str) -> str:
+        """Escape HTML characters in text"""
+        if not text:
+            return ""
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    
+    def _analyze_emotion_groups(self, entries: List[Entry]) -> Dict[str, int]:
+        """Analyze emotion distribution by groups using keyword matching"""
+        group_counts = defaultdict(int)
         
-        Args:
-            user_id: User identifier
-            action_type: Type of action to check
+        for entry in entries:
+            if not entry.emotions:
+                continue
+                
+            try:
+                emotions = json.loads(entry.emotions) if isinstance(entry.emotions, str) else entry.emotions
+            except (json.JSONDecodeError, TypeError):
+                continue
             
-        Returns:
-            Number of remaining requests
-        """
+            for emotion in emotions:
+                emotion_lower = emotion.lower().strip()
+                group_found = False
+                
+                # Проверяем каждую группу
+                for group_key, group_data in self.emotion_groups.items():
+                    keywords = group_data['keywords']
+                    
+                    # Ищем точное совпадение или частичное вхождение
+                    for keyword in keywords:
+                        if (emotion_lower == keyword.lower() or 
+                            keyword.lower() in emotion_lower or 
+                            emotion_lower in keyword.lower()):
+                            group_counts[group_key] += 1
+                            group_found = True
+                            break
+                    
+                    if group_found:
+                        break
+                
+                # Если эмоция не найдена ни в одной группе, относим к нейтральным
+                if not group_found:
+                    group_counts['neutral'] += 1
+        
+        return dict(group_counts)
+    
+    def _get_emotion_details_by_group(self, entries: List[Entry]) -> Dict[str, Counter]:
+        """Get detailed emotion counts for each group"""
+        group_emotions = defaultdict(Counter)
+        
+        for entry in entries:
+            if not entry.emotions:
+                continue
+                
+            try:
+                emotions = json.loads(entry.emotions) if isinstance(entry.emotions, str) else entry.emotions
+            except (json.JSONDecodeError, TypeError):
+                continue
+            
+            for emotion in emotions:
+                emotion_lower = emotion.lower().strip()
+                group_found = False
+                
+                # Проверяем каждую группу
+                for group_key, group_data in self.emotion_groups.items():
+                    keywords = group_data['keywords']
+                    
+                    # Ищем точное совпадение или частичное вхождение
+                    for keyword in keywords:
+                        if (emotion_lower == keyword.lower() or 
+                            keyword.lower() in emotion_lower or 
+                            emotion_lower in keyword.lower()):
+                            group_emotions[group_key][emotion] += 1
+                            group_found = True
+                            break
+                    
+                    if group_found:
+                        break
+                
+                # Если эмоция не найдена ни в одной группе, относим к нейтральным
+                if not group_found:
+                    group_emotions['neutral'][emotion] += 1
+        
+        return dict(group_emotions)
+    
+    def _analyze_triggers_by_groups(self, entries: List[Entry]) -> Dict[str, List[str]]:
+        """Analyze triggers grouped by emotion groups"""
+        group_triggers = defaultdict(Counter)
+        
+        for entry in entries:
+            if not entry.cause or not entry.emotions:
+                continue
+                
+            try:
+                emotions = json.loads(entry.emotions) if isinstance(entry.emotions, str) else entry.emotions
+            except (json.JSONDecodeError, TypeError):
+                continue
+                
+            cause = entry.cause.strip()
+            
+            if len(cause) < 3:  # Игнорируем очень короткие причины
+                continue
+            
+            # Определяем к какой группе относится эта запись
+            emotion_group = None
+            for emotion in emotions:
+                emotion_lower = emotion.lower().strip()
+                
+                for group_key, group_data in self.emotion_groups.items():
+                    keywords = group_data['keywords']
+                    
+                    for keyword in keywords:
+                        if (emotion_lower == keyword.lower() or 
+                            keyword.lower() in emotion_lower or 
+                            emotion_lower in keyword.lower()):
+                            emotion_group = group_key
+                            break
+                    
+                    if emotion_group:
+                        break
+                
+                if emotion_group:
+                    break
+            
+            # Если группа не определена, относим к нейтральным
+            if not emotion_group:
+                emotion_group = 'neutral'
+            
+            group_triggers[emotion_group][cause] += 1
+        
+        # Конвертируем в списки топ триггеров для каждой группы
+        result = {}
+        for group, triggers_counter in group_triggers.items():
+            result[group] = [trigger for trigger, _ in triggers_counter.most_common(5)]
+        
+        return result
+    
+    def _generate_insights_for_working_women(self, entries: List[Entry], group_analysis: Dict[str, int]) -> List[str]:
+        """Generate personalized insights for working women"""
+        insights = []
+        
+        total_entries = len(entries)
+        if total_entries == 0:
+            return insights
+        
+        # Анализ баланса эмоций
+        positive_count = group_analysis.get('recovery_growth', 0)
+        negative_count = group_analysis.get('tension_signal', 0)
+        
+        positive_ratio = positive_count / total_entries if total_entries > 0 else 0
+        negative_ratio = negative_count / total_entries if total_entries > 0 else 0
+        
+        # Инсайты на основе баланса эмоций
+        if negative_ratio > 0.7:
+            insights.append("Высокий уровень напряженных эмоций. Рассмотрите техники стрессменеджмента.")
+        elif positive_ratio > 0.6:
+            insights.append("Отличный эмоциональный баланс! Продолжайте заботиться о себе.")
+        elif negative_ratio > positive_ratio:
+            insights.append("Больше сигнальных эмоций. Возможно, стоит пересмотреть нагрузку.")
+        
+        # Анализ временных паттернов
+        time_patterns = self._analyze_time_patterns(entries)
+        if time_patterns:
+            morning_entries = sum(count for hour, count in time_patterns.items() if 6 <= hour <= 12)
+            evening_entries = sum(count for hour, count in time_patterns.items() if 18 <= hour <= 23)
+            
+            if evening_entries > morning_entries * 1.5:
+                insights.append("Больше записей вечером. Создайте ритуал завершения рабочего дня.")
+        
+        # Анализ разнообразия эмоций
+        unique_emotions = set()
+        for entry in entries:
+            if entry.emotions:
+                try:
+                    emotions = json.loads(entry.emotions) if isinstance(entry.emotions, str) else entry.emotions
+                    unique_emotions.update(emotions)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+        
+        emotion_variety = len(unique_emotions)
+        if emotion_variety < 5 and total_entries > 10:
+            insights.append("Попробуйте расширить эмоциональный словарь для лучшего самопонимания.")
+        elif emotion_variety > 15:
+            insights.append("Богатый эмоциональный словарь помогает вам лучше понимать себя!")
+        
+        return insights[:3]  # Максимум 3 инсайта
+    
+    def _get_time_of_day_name(self, hour: int) -> str:
+        """Get human-readable time of day name"""
+        if 6 <= hour < 12:
+            return "утром"
+        elif 12 <= hour < 17:
+            return "днём"
+        elif 17 <= hour < 22:
+            return "вечером"
+        else:
+            return "ночью"
+    
+    def _parse_period(self, period: str) -> Optional[int]:
+        """Parse period string to number of days"""
+        period_map = {
+            "7": 7,
+            "14": 14,
+            "30": 30,
+            "90": 90
+        }
+        return period_map.get(period)
+    
+    def _get_entries_for_period(self, user_id: int, days: int) -> List[Entry]:
+        """Get entries for the specified period"""
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
+        
         try:
-            if action_type not in self.limits:
-                action_type = 'general_command'
-            
-            limit_config = self.limits[action_type]
-            max_requests = limit_config['count']
-            time_window = limit_config['window']
-            
-            now = datetime.now()
-            user_key = f"{user_id}_{action_type}"
-            
-            # Clean old requests
-            cutoff_time = now - timedelta(seconds=time_window)
-            requests_queue = self.user_requests[user_key]
-            
-            while requests_queue and requests_queue[0] < cutoff_time:
-                requests_queue.popleft()
-            
-            return max(0, max_requests - len(requests_queue))
-            
+            with get_session() as session:
+                return session.query(Entry).filter(
+                    Entry.user_id == user_id,
+                    Entry.timestamp >= cutoff_date
+                ).order_by(Entry.timestamp.desc()).all()
         except Exception as e:
-            logger.error(f"Error getting remaining quota: {e}")
-            return 0
+            logger.error(f"Error getting entries for user {user_id}: {e}")
+            return []
     
-    def reset_user_limits(self, user_id: int):
-        """Reset all rate limits for a user"""
-        try:
-            keys_to_remove = [key for key in self.user_requests.keys() if key.startswith(f"{user_id}_")]
-            for key in keys_to_remove:
-                del self.user_requests[key]
-        except Exception as e:
-            logger.error(f"Error resetting user limits: {e}")
-
-def detect_spam_patterns(text: str) -> bool:
-    """
-    Detect potential spam patterns in text
-    
-    Args:
-        text: Text to analyze
+    def _analyze_time_patterns(self, entries: List[Entry]) -> Dict[int, int]:
+        """Analyze emotional activity by hour of day"""
+        hour_counts = defaultdict(int)
         
-    Returns:
-        True if spam detected, False otherwise
-    """
-    if not text:
-        return False
-    
-    text_lower = text.lower()
-    
-    # Spam indicators
-    spam_patterns = [
-        r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',  # URLs
-        r'@\w+',  # @ mentions
-        r'#\w+',  # Hashtags in excess
-        r'(.)\1{10,}',  # Repeated characters (10+ times)
-        r'\b(buy|sell|discount|offer|free|money|cash|prize|winner|click|visit)\b',  # Commercial keywords
-    ]
-    
-    # Check for spam patterns
-    for pattern in spam_patterns:
-        if re.search(pattern, text_lower):
-            return True
-    
-    # Check for excessive repetition
-    words = text_lower.split()
-    if len(words) > 5:
-        unique_words = set(words)
-        if len(unique_words) / len(words) < 0.3:  # Less than 30% unique words
-            return True
-    
-    # Check for excessive caps
-    if len(text) > 10:
-        caps_ratio = sum(1 for c in text if c.isupper()) / len(text)
-        if caps_ratio > 0.7:  # More than 70% caps
-            return True
-    
-    return False
-
-def validate_user_settings(settings_data: dict) -> bool:
-    """
-    Validate user settings data
-    
-    Args:
-        settings_data: Dictionary with user settings
+        for entry in entries:
+            if entry.timestamp:
+                hour = entry.timestamp.hour
+                hour_counts[hour] += 1
         
-    Returns:
-        True if valid, False otherwise
-    """
-    try:
-        valid_frequencies = ['normal', 'reduced', 'minimal']
-        
-        # Check notification frequency
-        if 'notification_frequency' in settings_data:
-            if settings_data['notification_frequency'] not in valid_frequencies:
-                return False
-        
-        # Check weekend notifications
-        if 'weekend_notifications' in settings_data:
-            if not isinstance(settings_data['weekend_notifications'], bool):
-                return False
-        
-        # Check daily ping times
-        if 'daily_ping_times' in settings_data:
-            times = settings_data['daily_ping_times']
-            if not isinstance(times, list) or len(times) > 10:
-                return False
-            
-            for time_str in times:
-                if not validate_time_format(time_str):
-                    return False
-        
-        # Check summary time
-        if 'weekly_summary_time' in settings_data:
-            if not validate_time_format(settings_data['weekly_summary_time']):
-                return False
-        
-        # Check summary day
-        if 'weekly_summary_day' in settings_data:
-            day = settings_data['weekly_summary_day']
-            if not isinstance(day, int) or not (0 <= day <= 6):
-                return False
-        
-        # Check data retention
-        if 'data_retention_days' in settings_data:
-            days = settings_data['data_retention_days']
-            if not isinstance(days, int) or not (30 <= days <= 3650):  # 30 days to 10 years
-                return False
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error validating user settings: {e}")
-        return False
-
-class SecurityLogger:
-    """Logger for security events"""
+        return dict(hour_counts)
     
-    def __init__(self):
-        self.security_logger = logging.getLogger('security')
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter(
-            '%(asctime)s - SECURITY - %(levelname)s - %(message)s'
-        )
-        handler.setFormatter(formatter)
-        self.security_logger.addHandler(handler)
-        self.security_logger.setLevel(logging.WARNING)
-    
-    def log_rate_limit(self, user_id: int, action: str):
-        """Log rate limit event"""
-        self.security_logger.warning(f"Rate limit exceeded - User: {user_id}, Action: {action}")
-    
-    def log_spam_attempt(self, user_id: int, content: str):
-        """Log spam attempt"""
-        self.security_logger.warning(f"Spam detected - User: {user_id}, Content: {content[:100]}")
-    
-    def log_invalid_data(self, user_id: int, data_type: str, error: str):
-        """Log invalid data submission"""
-        self.security_logger.warning(f"Invalid data - User: {user_id}, Type: {data_type}, Error: {error}")
-    
-    def log_injection_attempt(self, user_id: int, content: str):
-        """Log potential injection attempt"""
-        self.security_logger.error(f"Injection attempt - User: {user_id}, Content: {content[:100]}")
-
-# Global security logger instance
-security_logger = SecurityLogger()
+    def generate_csv_export(self, entries: List[Entry]) -> io.BytesIO:
+        """Generate CSV export of emotional data"""
+        output = io.StringIO()
+        
+        fieldnames = [
+            'Дата', 'Время', 'Эмоции', 'Группа_эмоций', 'Причина', 'Заметки', 'Валентность', 'Активация'
+        ]
+        
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        
+        for entry in entries:
+            try:
+                emotions_str = ''
+                emotion_group = "Нейтральные"
+                
+                if entry.emotions:
+                    emotions = json.loads(entry.emotions) if isinstance(entry.emotions, str) else entry.emotions
+                    emotions_str = ', '.join(emotions)
+                    
+                    # Определяем группу эмоций для CSV
+                    for emotion in emotions:
+                        emotion_lower = emotion.lower().strip()
+                        
+                        for group_key, group_data in self.emotion_groups.items():
+                            keywords = group_data['keywords']
+                            
+                            for keyword in keywords:
+                                if (emotion_lower == keyword.lower() or 
+                                    keyword.lower() in emotion_lower or 
+                                    emotion_lower in keyword.lower()):
+                                    if group_key == 'recovery_growth':
+                                        emotion_group = "Восстановления и роста"
+                                    elif group_key == 'tension_signal':
+                                        emotion_group = "Напряжения и сигнала"
+                                    else:
+                                        emotion_group = "Нейтральные"
+                                    break
+                            
+                            if emotion_group != "Нейтральные":
+                                break
+                        
+                        if emotion_group != "Нейтральные":
+                            break
+                
+                # Конвертируем валентность и активацию в текст
+                valence_text = ""
+                if entry.valence is not None:
+                    if entry.valence > 0.3:
+                        valence_text = "Положительная"
+                    elif entry.valence < -0.3:
+                        valence_text = "Отрицательная"
+                    else:
+                        valence_text = "Нейтральная"
+                
+                arousal_text = ""
+                if entry.arousal is not None:
+                    if entry.arousal > 1.3:
+                        arousal_text = "Высокая"
+                    elif entry.arousal < 0.7:
+                        arousal_text = "Низкая"
+                    else:
+                        arousal_text = "Средняя"
+                
+                writer.writerow({
+                    'Дата': entry.timestamp.strftime('%Y-%m-%d') if entry.timestamp else '',
+                    'Время': entry.timestamp.strftime('%H:%M:%S') if entry.timestamp else '',
+                    'Эмоции': emotions_str,
+                    'Группа_эмоций': emotion_group,
+                    'Причина': entry.cause or '',
+                    'Заметки': entry.notes or '',
+                    'Валентность': valence_text,
+                    'Активация': arousal_text
+                })
+            except Exception as e:
+                logger.error(f"Error processing entry {entry.id}: {e}")
+                continue
+        
+        # Convert to bytes
+        output.seek(0)
+        csv_bytes = io.BytesIO()
+        csv_bytes.write(output.getvalue().encode('utf-8-sig'))  # UTF-8 with BOM for Excel
+        csv_bytes.seek(0)
+        
+        return csv_bytes
