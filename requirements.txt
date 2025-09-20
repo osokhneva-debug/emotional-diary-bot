@@ -16,6 +16,7 @@ numpy==1.25.2
 
 # Web server for webhooks
 aiohttp==3.9.1
+aiohttp-cors==0.7.0
 gunicorn==21.2.0
 
 # Environment and configuration
@@ -31,7 +32,7 @@ black==23.11.0
 flake8==6.1.0
 
 # Database drivers
-psycopg2-binary==2.9.9  # For PostgreSQL (if needed later)
+psycopg2-binary==2.9.9
 
 # Additional utilities
 requests==2.31.0
