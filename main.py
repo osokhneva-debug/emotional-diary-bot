@@ -90,15 +90,6 @@ class EmotionalDiaryBot:
         
         logger.info("Bot setup completed")
 
-    def _create_short_callback_data(self, data: str) -> str:
-        """Create short callback data using hash for long strings"""
-        if len(data) <= 64:  # Telegram limit
-            return data
-        
-        # Create hash for long data
-        hash_obj = hashlib.md5(data.encode())
-        return f"h_{hash_obj.hexdigest()[:10]}"
-
     @rate_limit
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command with onboarding"""
