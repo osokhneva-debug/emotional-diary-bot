@@ -12,11 +12,15 @@ services:
       - key: BOT_TOKEN
         sync: false  # Set manually in dashboard
       - key: WEBHOOK_URL
-        sync: false  # Set to your render app URL
+        sync: false  # Set to https://your-app-name.onrender.com (without /webhook)
       - key: DATABASE_URL
         value: sqlite:///./data/emotional_diary.db
       - key: PORT
         value: 8080
+      - key: HOST
+        value: 0.0.0.0
+      - key: LOG_LEVEL
+        value: INFO
       - key: PYTHON_VERSION
         value: 3.11.0
     
@@ -29,12 +33,15 @@ services:
 # Build settings
 buildFilter:
   paths:
-  - app/**
+  - "**/*.py"
   - requirements.txt
-  - main.py
-  - Dockerfile
+  - render.yaml
   
-# Health check settings
+# Health check settings - ИСПРАВЛЕНО
 healthCheck:
   path: /health
   port: 8080
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
