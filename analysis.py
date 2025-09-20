@@ -2,10 +2,9 @@
 import json
 import csv
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional
 from collections import Counter, defaultdict
 import io
-import pytz
 
 from db import get_session, User, Entry
 from i18n import TEXTS, EMOTION_CATEGORIES
@@ -14,7 +13,7 @@ class EmotionAnalyzer:
     """Analyzes emotional data and generates insights"""
     
     def __init__(self):
-        # Исправленная группировка эмоций на основе научных исследований
+        # Группировка эмоций на основе научных исследований
         self.emotion_groups = {
             'recovery_growth': {
                 'name': '🌱 Эмоции восстановления и роста',
@@ -77,8 +76,6 @@ class EmotionAnalyzer:
             # Header
             period_name = {7: "неделю", 14: "2 недели", 30: "месяц", 90: "3 месяца"}.get(days, f"{days} дней")
             summary_parts.append(f"📊 <b>Сводка за {period_name}</b>")
-            summary_parts.append("")
-            summary_parts.append("📊 <b>Твоя неделя в эмоциях</b>")
             summary_parts.append("")
             
             # Emotion groups analysis
@@ -289,18 +286,6 @@ class EmotionAnalyzer:
                 Entry.user_id == user_id,
                 Entry.timestamp >= cutoff_date
             ).order_by(Entry.timestamp.desc()).all()
-    
-    def _get_emotion_frequency(self, entries: List[Entry]) -> Counter:
-        """Get frequency of specific emotions"""
-        emotion_counts = Counter()
-        
-        for entry in entries:
-            if entry.emotions:
-                emotions = json.loads(entry.emotions) if isinstance(entry.emotions, str) else entry.emotions
-                for emotion in emotions:
-                    emotion_counts[emotion] += 1
-        
-        return emotion_counts
     
     def _analyze_time_patterns(self, entries: List[Entry]) -> Dict[int, int]:
         """Analyze emotional activity by hour of day"""
