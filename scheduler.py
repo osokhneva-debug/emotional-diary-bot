@@ -1,355 +1,356 @@
-# scheduler.py
-import asyncio
+# security.py
+import re
+import html
 import logging
-from datetime import datetime, timedelta, timezone  # ИСПРАВЛЕНО: добавлен timedelta
-from typing import List, Callable
-import pytz
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.date import DateTrigger
-from apscheduler.jobstores.memory import MemoryJobStore
-from apscheduler.executors.asyncio import AsyncIOExecutor
-
-from db import get_session, User, Schedule, UserSettings, get_active_users
-from i18n import TEXTS
+from typing import Optional
+import bleach
+from datetime import datetime, timedelta
+from collections import defaultdict, deque
 
 logger = logging.getLogger(__name__)
 
-class EmotionScheduler:
-    """Handles all scheduled tasks for the emotion diary bot"""
+def sanitize_input(text: str, max_length: int = 1000) -> str:
+    """
+    Sanitize user input to prevent injection attacks and limit length
+    
+    Args:
+        text: Input text to sanitize
+        max_length: Maximum allowed length
+        
+    Returns:
+        Sanitized and truncated text
+    """
+    if not text:
+        return ""
+    
+    # Remove excessive whitespace
+    text = re.sub(r'\s+', ' ', text.strip())
+    
+    # Limit length
+    if len(text) > max_length:
+        text = text[:max_length] + "..."
+    
+    # HTML escape to prevent injection
+    text = html.escape(text)
+    
+    # Remove potentially malicious patterns
+    # Remove script tags and similar
+    text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r'javascript:', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'on\w+\s*=', '', text, flags=re.IGNORECASE)
+    
+    # Remove excessive special characters that might be used for injection
+    text = re.sub(r'[<>"\'{};]', '', text)
+    
+    # Remove null bytes and control characters except newlines and tabs
+    text = ''.join(char for char in text if ord(char) >= 32 or char in '\n\t')
+    
+    return text
+
+def validate_emotion_data(emotions: list, category: str, valence: float, arousal: float) -> bool:
+    """
+    Validate emotion entry data
+    
+    Args:
+        emotions: List of emotion strings
+        category: Emotion category
+        valence: Valence value (-1 to 1)
+        arousal: Arousal value (0 to 2)
+        
+    Returns:
+        True if data is valid, False otherwise
+    """
+    try:
+        # Check emotions list
+        if not isinstance(emotions, list) or len(emotions) == 0:
+            return False
+        
+        if len(emotions) > 10:  # Max 10 emotions per entry
+            return False
+        
+        for emotion in emotions:
+            if not isinstance(emotion, str) or len(emotion) > 50:
+                return False
+        
+        # Check category
+        if not isinstance(category, str) or len(category) > 100:
+            return False
+        
+        # Check valence range
+        if not isinstance(valence, (int, float)) or not (-1 <= valence <= 1):
+            return False
+        
+        # Check arousal range
+        if not isinstance(arousal, (int, float)) or not (0 <= arousal <= 2):
+            return False
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error validating emotion data: {e}")
+        return False
+
+def validate_timezone(timezone_str: str) -> bool:
+    """
+    Validate timezone string
+    
+    Args:
+        timezone_str: Timezone string to validate
+        
+    Returns:
+        True if valid timezone, False otherwise
+    """
+    try:
+        import pytz
+        return timezone_str in pytz.all_timezones
+    except Exception:
+        return False
+
+def validate_time_format(time_str: str) -> bool:
+    """
+    Validate time format (HH:MM)
+    
+    Args:
+        time_str: Time string to validate
+        
+    Returns:
+        True if valid format, False otherwise
+    """
+    try:
+        pattern = r'^([01]?[0-9]|2[0-3]):[0-5][0-9]$'
+        return bool(re.match(pattern, time_str))
+    except Exception:
+        return False
+
+class RateLimiter:
+    """Rate limiter to prevent spam and abuse"""
     
     def __init__(self):
-        # Configure scheduler
-        jobstores = {
-            'default': MemoryJobStore()
-        }
-        executors = {
-            'default': AsyncIOExecutor()
-        }
-        job_defaults = {
-            'coalesce': False,
-            'max_instances': 3
-        }
+        # Store request timestamps for each user
+        self.user_requests = defaultdict(lambda: deque())
         
-        self.scheduler = AsyncIOScheduler(
-            jobstores=jobstores,
-            executors=executors,
-            job_defaults=job_defaults,
-            timezone=pytz.UTC
+        # Rate limits (requests per time window)
+        self.limits = {
+            'emotion_entry': {'count': 50, 'window': 3600},    # 50 entries per hour
+            'summary_request': {'count': 20, 'window': 3600},   # 20 summaries per hour
+            'export_request': {'count': 5, 'window': 3600},     # 5 exports per hour
+            'general_command': {'count': 100, 'window': 3600},  # 100 commands per hour
+            'message': {'count': 200, 'window': 3600}           # 200 messages per hour
+        }
+    
+    def is_allowed(self, user_id: int, action_type: str = 'general_command') -> bool:
+        """
+        Check if user is allowed to perform action
+        
+        Args:
+            user_id: User identifier
+            action_type: Type of action to check
+            
+        Returns:
+            True if allowed, False if rate limited
+        """
+        try:
+            if action_type not in self.limits:
+                action_type = 'general_command'
+            
+            limit_config = self.limits[action_type]
+            max_requests = limit_config['count']
+            time_window = limit_config['window']
+            
+            now = datetime.now()
+            user_key = f"{user_id}_{action_type}"
+            
+            # Clean old requests outside the time window
+            cutoff_time = now - timedelta(seconds=time_window)
+            requests_queue = self.user_requests[user_key]
+            
+            while requests_queue and requests_queue[0] < cutoff_time:
+                requests_queue.popleft()
+            
+            # Check if under limit
+            if len(requests_queue) >= max_requests:
+                return False
+            
+            # Add current request
+            requests_queue.append(now)
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error in rate limiter: {e}")
+            return True  # Allow on error to avoid blocking legitimate users
+    
+    def get_remaining_quota(self, user_id: int, action_type: str = 'general_command') -> int:
+        """
+        Get remaining quota for user action
+        
+        Args:
+            user_id: User identifier
+            action_type: Type of action to check
+            
+        Returns:
+            Number of remaining requests
+        """
+        try:
+            if action_type not in self.limits:
+                action_type = 'general_command'
+            
+            limit_config = self.limits[action_type]
+            max_requests = limit_config['count']
+            time_window = limit_config['window']
+            
+            now = datetime.now()
+            user_key = f"{user_id}_{action_type}"
+            
+            # Clean old requests
+            cutoff_time = now - timedelta(seconds=time_window)
+            requests_queue = self.user_requests[user_key]
+            
+            while requests_queue and requests_queue[0] < cutoff_time:
+                requests_queue.popleft()
+            
+            return max(0, max_requests - len(requests_queue))
+            
+        except Exception as e:
+            logger.error(f"Error getting remaining quota: {e}")
+            return 0
+    
+    def reset_user_limits(self, user_id: int):
+        """Reset all rate limits for a user"""
+        try:
+            keys_to_remove = [key for key in self.user_requests.keys() if key.startswith(f"{user_id}_")]
+            for key in keys_to_remove:
+                del self.user_requests[key]
+        except Exception as e:
+            logger.error(f"Error resetting user limits: {e}")
+
+def detect_spam_patterns(text: str) -> bool:
+    """
+    Detect potential spam patterns in text
+    
+    Args:
+        text: Text to analyze
+        
+    Returns:
+        True if spam detected, False otherwise
+    """
+    if not text:
+        return False
+    
+    text_lower = text.lower()
+    
+    # Spam indicators
+    spam_patterns = [
+        r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',  # URLs
+        r'@\w+',  # @ mentions
+        r'#\w+',  # Hashtags in excess
+        r'(.)\1{10,}',  # Repeated characters (10+ times)
+        r'\b(buy|sell|discount|offer|free|money|cash|prize|winner|click|visit)\b',  # Commercial keywords
+    ]
+    
+    # Check for spam patterns
+    for pattern in spam_patterns:
+        if re.search(pattern, text_lower):
+            return True
+    
+    # Check for excessive repetition
+    words = text_lower.split()
+    if len(words) > 5:
+        unique_words = set(words)
+        if len(unique_words) / len(words) < 0.3:  # Less than 30% unique words
+            return True
+    
+    # Check for excessive caps
+    if len(text) > 10:
+        caps_ratio = sum(1 for c in text if c.isupper()) / len(text)
+        if caps_ratio > 0.7:  # More than 70% caps
+            return True
+    
+    return False
+
+def validate_user_settings(settings_data: dict) -> bool:
+    """
+    Validate user settings data
+    
+    Args:
+        settings_data: Dictionary with user settings
+        
+    Returns:
+        True if valid, False otherwise
+    """
+    try:
+        valid_frequencies = ['normal', 'reduced', 'minimal']
+        
+        # Check notification frequency
+        if 'notification_frequency' in settings_data:
+            if settings_data['notification_frequency'] not in valid_frequencies:
+                return False
+        
+        # Check weekend notifications
+        if 'weekend_notifications' in settings_data:
+            if not isinstance(settings_data['weekend_notifications'], bool):
+                return False
+        
+        # Check daily ping times
+        if 'daily_ping_times' in settings_data:
+            times = settings_data['daily_ping_times']
+            if not isinstance(times, list) or len(times) > 10:
+                return False
+            
+            for time_str in times:
+                if not validate_time_format(time_str):
+                    return False
+        
+        # Check summary time
+        if 'weekly_summary_time' in settings_data:
+            if not validate_time_format(settings_data['weekly_summary_time']):
+                return False
+        
+        # Check summary day
+        if 'weekly_summary_day' in settings_data:
+            day = settings_data['weekly_summary_day']
+            if not isinstance(day, int) or not (0 <= day <= 6):
+                return False
+        
+        # Check data retention
+        if 'data_retention_days' in settings_data:
+            days = settings_data['data_retention_days']
+            if not isinstance(days, int) or not (30 <= days <= 3650):  # 30 days to 10 years
+                return False
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error validating user settings: {e}")
+        return False
+
+class SecurityLogger:
+    """Logger for security events"""
+    
+    def __init__(self):
+        self.security_logger = logging.getLogger('security')
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            '%(asctime)s - SECURITY - %(levelname)s - %(message)s'
         )
-        
-        # Callbacks to be set by main bot
-        self.send_daily_ping_callback: Callable = None
-        self.send_weekly_summary_callback: Callable = None
-        
-    async def start(self):
-        """Start the scheduler"""
-        try:
-            self.scheduler.start()
-            
-            # Schedule daily tasks
-            await self.schedule_daily_pings()
-            await self.schedule_weekly_summaries()
-            await self.schedule_maintenance_tasks()
-            
-            logger.info("Emotion scheduler started successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to start scheduler: {e}")
-            raise
+        handler.setFormatter(formatter)
+        self.security_logger.addHandler(handler)
+        self.security_logger.setLevel(logging.WARNING)
     
-    async def stop(self):
-        """Stop the scheduler"""
-        if self.scheduler.running:
-            self.scheduler.shutdown(wait=False)
-            logger.info("Emotion scheduler stopped")
+    def log_rate_limit(self, user_id: int, action: str):
+        """Log rate limit event"""
+        self.security_logger.warning(f"Rate limit exceeded - User: {user_id}, Action: {action}")
     
-    def set_callbacks(self, daily_ping_callback: Callable, weekly_summary_callback: Callable):
-        """Set callback functions for sending notifications"""
-        self.send_daily_ping_callback = daily_ping_callback
-        self.send_weekly_summary_callback = weekly_summary_callback
+    def log_spam_attempt(self, user_id: int, content: str):
+        """Log spam attempt"""
+        self.security_logger.warning(f"Spam detected - User: {user_id}, Content: {content[:100]}")
     
-    async def schedule_daily_pings(self):
-        """Schedule daily emotion check-ins for all active users"""
-        try:
-            active_users = get_active_users(days=7)  # Users active in last 7 days
-            
-            for user in active_users:
-                if user.paused:
-                    continue
-                    
-                await self.schedule_user_daily_pings(user)
-                
-            logger.info(f"Scheduled daily pings for {len(active_users)} active users")
-            
-        except Exception as e:
-            logger.error(f"Error scheduling daily pings: {e}")
+    def log_invalid_data(self, user_id: int, data_type: str, error: str):
+        """Log invalid data submission"""
+        self.security_logger.warning(f"Invalid data - User: {user_id}, Type: {data_type}, Error: {error}")
     
-    async def schedule_user_daily_pings(self, user: User):
-        """Schedule daily pings for a specific user"""
-        try:
-            user_tz = pytz.timezone(user.timezone)
-            
-            # Get user settings or use defaults
-            with get_session() as session:
-                settings = session.query(UserSettings).filter(UserSettings.user_id == user.id).first()
-                if not settings:
-                    ping_times = ["09:00", "13:00", "17:00", "21:00"]
-                    weekend_notifications = True
-                else:
-                    ping_times = settings.daily_ping_times
-                    weekend_notifications = settings.weekend_notifications
-            
-            # Schedule pings for each time
-            for ping_time in ping_times:
-                hour, minute = map(int, ping_time.split(':'))
-                
-                # Create cron trigger
-                if weekend_notifications:
-                    # All days
-                    trigger = CronTrigger(
-                        hour=hour,
-                        minute=minute,
-                        timezone=user_tz
-                    )
-                else:
-                    # Weekdays only (Monday=0, Sunday=6)
-                    trigger = CronTrigger(
-                        hour=hour,
-                        minute=minute,
-                        day_of_week='0-4',  # Monday to Friday
-                        timezone=user_tz
-                    )
-                
-                job_id = f"daily_ping_{user.chat_id}_{ping_time}"
-                
-                # Remove existing job if it exists
-                if self.scheduler.get_job(job_id):
-                    self.scheduler.remove_job(job_id)
-                
-                # Add new job
-                self.scheduler.add_job(
-                    self.send_daily_ping_to_user,
-                    trigger=trigger,
-                    args=[user.chat_id],
-                    id=job_id,
-                    replace_existing=True,
-                    misfire_grace_time=300  # 5 minutes grace period
-                )
-                
-        except Exception as e:
-            logger.error(f"Error scheduling daily pings for user {user.chat_id}: {e}")
-    
-    async def schedule_weekly_summaries(self):
-        """Schedule weekly summaries for all active users"""
-        try:
-            active_users = get_active_users(days=14)  # Users active in last 2 weeks
-            
-            for user in active_users:
-                if user.paused:
-                    continue
-                    
-                await self.schedule_user_weekly_summary(user)
-                
-            logger.info(f"Scheduled weekly summaries for {len(active_users)} active users")
-            
-        except Exception as e:
-            logger.error(f"Error scheduling weekly summaries: {e}")
-    
-    async def schedule_user_weekly_summary(self, user: User):
-        """Schedule weekly summary for a specific user"""
-        try:
-            user_tz = pytz.timezone(user.timezone)
-            
-            # Get user settings or use defaults
-            with get_session() as session:
-                settings = session.query(UserSettings).filter(UserSettings.user_id == user.id).first()
-                if not settings:
-                    summary_time = "21:00"
-                    summary_day = 6  # Sunday
-                else:
-                    summary_time = settings.weekly_summary_time
-                    summary_day = settings.weekly_summary_day
-            
-            hour, minute = map(int, summary_time.split(':'))
-            
-            # Create cron trigger for weekly summary
-            trigger = CronTrigger(
-                hour=hour,
-                minute=minute,
-                day_of_week=summary_day,
-                timezone=user_tz
-            )
-            
-            job_id = f"weekly_summary_{user.chat_id}"
-            
-            # Remove existing job if it exists
-            if self.scheduler.get_job(job_id):
-                self.scheduler.remove_job(job_id)
-            
-            # Add new job
-            self.scheduler.add_job(
-                self.send_weekly_summary_to_user,
-                trigger=trigger,
-                args=[user.chat_id],
-                id=job_id,
-                replace_existing=True,
-                misfire_grace_time=3600  # 1 hour grace period
-            )
-            
-        except Exception as e:
-            logger.error(f"Error scheduling weekly summary for user {user.chat_id}: {e}")
-    
-    async def schedule_maintenance_tasks(self):
-        """Schedule maintenance tasks"""
-        # Daily cleanup at 2 AM UTC
-        self.scheduler.add_job(
-            self.cleanup_old_data,
-            CronTrigger(hour=2, minute=0, timezone=pytz.UTC),
-            id="daily_cleanup",
-            replace_existing=True
-        )
-        
-        # Weekly user reactivation check on Mondays at 1 AM UTC
-        self.scheduler.add_job(
-            self.reschedule_all_users,
-            CronTrigger(hour=1, minute=0, day_of_week=0, timezone=pytz.UTC),
-            id="weekly_reschedule",
-            replace_existing=True
-        )
-        
-        logger.info("Scheduled maintenance tasks")
-    
-    async def send_daily_ping_to_user(self, chat_id: int):
-        """Send daily ping to specific user"""
-        try:
-            if self.send_daily_ping_callback:
-                await self.send_daily_ping_callback(chat_id)
-            else:
-                logger.warning("Daily ping callback not set")
-                
-        except Exception as e:
-            logger.error(f"Error sending daily ping to {chat_id}: {e}")
-    
-    async def send_weekly_summary_to_user(self, chat_id: int):
-        """Send weekly summary to specific user"""
-        try:
-            if self.send_weekly_summary_callback:
-                await self.send_weekly_summary_callback(chat_id)
-            else:
-                logger.warning("Weekly summary callback not set")
-                
-        except Exception as e:
-            logger.error(f"Error sending weekly summary to {chat_id}: {e}")
-    
-    async def reschedule_user(self, user: User):
-        """Reschedule notifications for a specific user"""
-        try:
-            # Remove existing jobs
-            jobs_to_remove = []
-            for job in self.scheduler.get_jobs():
-                if f"_{user.chat_id}" in job.id:
-                    jobs_to_remove.append(job.id)
-            
-            for job_id in jobs_to_remove:
-                self.scheduler.remove_job(job_id)
-            
-            # Reschedule if user is not paused
-            if not user.paused:
-                await self.schedule_user_daily_pings(user)
-                await self.schedule_user_weekly_summary(user)
-                
-            logger.info(f"Rescheduled notifications for user {user.chat_id}")
-            
-        except Exception as e:
-            logger.error(f"Error rescheduling user {user.chat_id}: {e}")
-    
-    async def reschedule_all_users(self):
-        """Reschedule notifications for all active users"""
-        try:
-            active_users = get_active_users(days=30)
-            
-            for user in active_users:
-                await self.reschedule_user(user)
-                
-            logger.info(f"Rescheduled notifications for {len(active_users)} users")
-            
-        except Exception as e:
-            logger.error(f"Error rescheduling all users: {e}")
-    
-    async def cleanup_old_data(self):
-        """Clean up old data and schedules"""
-        try:
-            from db import cleanup_old_data
-            cleanup_old_data()
-            logger.info("Completed daily data cleanup")
-            
-        except Exception as e:
-            logger.error(f"Error during data cleanup: {e}")
-    
-    async def postpone_user_ping(self, chat_id: int, minutes: int = 15):
-        """Postpone next ping for a user by specified minutes"""
-        try:
-            postpone_time = datetime.now(timezone.utc) + timedelta(minutes=minutes)
-            
-            job_id = f"postponed_ping_{chat_id}_{postpone_time.timestamp()}"
-            
-            self.scheduler.add_job(
-                self.send_daily_ping_to_user,
-                DateTrigger(run_date=postpone_time),
-                args=[chat_id],
-                id=job_id,
-                replace_existing=True
-            )
-            
-            logger.info(f"Postponed ping for user {chat_id} by {minutes} minutes")
-            
-        except Exception as e:
-            logger.error(f"Error postponing ping for user {chat_id}: {e}")
-    
-    async def skip_user_day(self, chat_id: int):
-        """Skip all remaining pings for a user today"""
-        try:
-            # Mark today as skipped in the database
-            with get_session() as session:
-                user = session.query(User).filter(User.chat_id == chat_id).first()
-                if user:
-                    user_tz = pytz.timezone(user.timezone)
-                    today = datetime.now(user_tz).strftime('%Y-%m-%d')
-                    
-                    # Find or create today's schedule
-                    schedule = session.query(Schedule).filter(
-                        Schedule.user_id == user.id,
-                        Schedule.date_local == today
-                    ).first()
-                    
-                    if not schedule:
-                        schedule = Schedule(
-                            user_id=user.id,
-                            date_local=today,
-                            times_local=["09:00", "13:00", "17:00", "21:00"]
-                        )
-                        session.add(schedule)
-                    
-                    schedule.skipped = True
-                    session.commit()
-                    
-                    logger.info(f"Marked day as skipped for user {chat_id}")
-                    
-        except Exception as e:
-            logger.error(f"Error skipping day for user {chat_id}: {e}")
-    
-    def get_scheduler_status(self) -> dict:
-        """Get current scheduler status"""
-        return {
-            'running': self.scheduler.running,
-            'total_jobs': len(self.scheduler.get_jobs()),
-            'job_details': [
-                {
-                    'id': job.id,
-                    'next_run': job.next_run_time.isoformat() if job.next_run_time else None,
-                    'trigger': str(job.trigger)
-                }
-                for job in self.scheduler.get_jobs()[:10]  # Show first 10 jobs
-            ]
-        }
+    def log_injection_attempt(self, user_id: int, content: str):
+        """Log potential injection attempt"""
+        self.security_logger.error(f"Injection attempt - User: {user_id}, Content: {content[:100]}")
+
+# Global security logger instance
+security_logger = SecurityLogger()
