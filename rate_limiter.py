@@ -1,323 +1,851 @@
-# rate_limiter.py
-import functools
+# main.py
+import os
 import logging
-from typing import Callable, Optional
-from datetime import datetime, timedelta
-from collections import defaultdict, deque
-from telegram import Update
-from telegram.ext import ContextTypes
+import asyncio
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Dict, List
+import json
+import hashlib
 
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram.constants import ParseMode
+from telegram.error import BadRequest, Forbidden
+from sqlalchemy import text
+
+from db import init_db, User, Entry, Schedule, UserSettings, get_session
+from scheduler import EmotionScheduler
+from analysis import EmotionAnalyzer
+from i18n import TEXTS, EMOTION_CATEGORIES
+from security import sanitize_input
+from rate_limiter import rate_limit, rate_limit_emotion_entry, rate_limit_summary, rate_limit_export
+
+# Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-class RateLimiter:
-    """Rate limiter to prevent spam and abuse"""
-    
+# Bot configuration
+BOT_TOKEN = os.getenv('BOT_TOKEN') or os.getenv('TELEGRAM_BOT_TOKEN')
+if not BOT_TOKEN:
+    raise ValueError("Bot token not found. Set BOT_TOKEN or TELEGRAM_BOT_TOKEN environment variable")
+
+# Debug токена (скрыть последние символы)
+logger.info(f"Bot token loaded: {BOT_TOKEN[:20]}...{BOT_TOKEN[-10:]}")
+
+WEBHOOK_URL = os.getenv('WEBHOOK_URL')
+PORT = int(os.getenv('PORT', 8080))
+
+logger.info(f"Webhook URL: {WEBHOOK_URL}")
+logger.info(f"Port: {PORT}")
+
+class EmotionalDiaryBot:
     def __init__(self):
-        # Store request timestamps for each user
-        self.user_requests = defaultdict(lambda: deque())
+        self.app = None
+        self.scheduler = EmotionScheduler()
+        self.analyzer = EmotionAnalyzer()
         
-        # Rate limits (requests per time window)
-        self.limits = {
-            'emotion_entry': {'count': 50, 'window': 3600},    # 50 entries per hour
-            'summary_request': {'count': 20, 'window': 3600},   # 20 summaries per hour
-            'export_request': {'count': 5, 'window': 3600},     # 5 exports per hour
-            'general_command': {'count': 100, 'window': 3600},  # 100 commands per hour
-            'message': {'count': 200, 'window': 3600}           # 200 messages per hour
+    async def setup(self):
+        """Initialize bot application"""
+        # Создаем Application и инициализируем его
+        self.app = Application.builder().token(BOT_TOKEN).build()
+        
+        # ВАЖНО: Инициализируем Application
+        try:
+            await self.app.initialize()
+            logger.info("Application initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize application: {e}")
+            raise
+        
+        # Command handlers
+        self.app.add_handler(CommandHandler("start", self.start_command))
+        self.app.add_handler(CommandHandler("note", self.note_command))
+        self.app.add_handler(CommandHandler("summary", self.summary_command))
+        self.app.add_handler(CommandHandler("export", self.export_command))
+        self.app.add_handler(CommandHandler("timezone", self.timezone_command))
+        self.app.add_handler(CommandHandler("pause", self.pause_command))
+        self.app.add_handler(CommandHandler("resume", self.resume_command))
+        self.app.add_handler(CommandHandler("delete_me", self.delete_me_command))
+        self.app.add_handler(CommandHandler("help", self.help_command))
+        
+        # Callback handlers
+        self.app.add_handler(CallbackQueryHandler(self.handle_callback))
+        
+        # Message handlers
+        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+        
+        # Initialize database and scheduler
+        await init_db()
+        
+        # Set scheduler callbacks
+        self.scheduler.set_callbacks(
+            self.send_daily_ping,
+            self.send_weekly_summary
+        )
+        
+        await self.scheduler.start()
+        
+        logger.info("Bot setup completed")
+
+    def _create_short_callback_data(self, data: str) -> str:
+        """Create short callback data using hash for long strings"""
+        if len(data) <= 64:  # Telegram limit
+            return data
+        
+        # Create hash for long data
+        hash_obj = hashlib.md5(data.encode())
+        return f"h_{hash_obj.hexdigest()[:10]}"
+
+    @rate_limit
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /start command with onboarding"""
+        user = update.effective_user
+        chat_id = update.effective_chat.id
+        
+        with get_session() as session:
+            # Check if user exists
+            existing_user = session.query(User).filter(User.chat_id == chat_id).first()
+            
+            if not existing_user:
+                # Create new user
+                new_user = User(
+                    chat_id=chat_id,
+                    username=user.username,
+                    first_name=user.first_name,
+                    timezone='Europe/Moscow'  # Default timezone
+                )
+                session.add(new_user)
+                session.commit()
+                
+                # Send welcome message with scientific explanation
+                await update.message.reply_text(
+                    TEXTS['onboarding_welcome'],
+                    parse_mode=ParseMode.HTML
+                )
+                
+                # Setup timezone
+                keyboard = self.get_timezone_keyboard()
+                await update.message.reply_text(
+                    TEXTS['setup_timezone'],
+                    reply_markup=keyboard,
+                    parse_mode=ParseMode.HTML
+                )
+                
+            else:
+                name = f" {user.first_name}" if user.first_name else ""
+                await update.message.reply_text(
+                    TEXTS['welcome_back'].format(name=name),
+                    parse_mode=ParseMode.HTML
+                )
+
+    @rate_limit_emotion_entry
+    async def note_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /note command - start emotion logging process"""
+        chat_id = update.effective_chat.id
+        
+        with get_session() as session:
+            user = session.query(User).filter(User.chat_id == chat_id).first()
+            if not user:
+                await update.message.reply_text(TEXTS['not_registered'])
+                return
+                
+        # Show emotion categories
+        keyboard = self.get_emotion_categories_keyboard()
+        await update.message.reply_text(
+            TEXTS['choose_emotion_category'],
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML
+        )
+
+    @rate_limit_summary
+    async def summary_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /summary command"""
+        chat_id = update.effective_chat.id
+        
+        with get_session() as session:
+            user = session.query(User).filter(User.chat_id == chat_id).first()
+            if not user:
+                await update.message.reply_text(TEXTS['not_registered'])
+                return
+        
+        keyboard = self.get_summary_period_keyboard()
+        await update.message.reply_text(
+            TEXTS['choose_summary_period'],
+            reply_markup=keyboard
+        )
+
+    @rate_limit_export
+    async def export_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /export command"""
+        chat_id = update.effective_chat.id
+        
+        with get_session() as session:
+            user = session.query(User).filter(User.chat_id == chat_id).first()
+            if not user:
+                await update.message.reply_text(TEXTS['not_registered'])
+                return
+            
+            entries = session.query(Entry).filter(Entry.user_id == user.id).all()
+            
+            if not entries:
+                await update.message.reply_text(TEXTS['no_data_to_export'])
+                return
+        
+        # Generate CSV
+        csv_data = self.analyzer.generate_csv_export(entries)
+        
+        # Send as document
+        await update.message.reply_document(
+            document=csv_data,
+            filename=f"emotional_diary_{datetime.now().strftime('%Y%m%d')}.csv",
+            caption=TEXTS['export_complete']
+        )
+
+    @rate_limit
+    async def timezone_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /timezone command"""
+        keyboard = self.get_timezone_keyboard()
+        await update.message.reply_text(
+            TEXTS['change_timezone'],
+            reply_markup=keyboard
+        )
+
+    @rate_limit
+    async def pause_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /pause command"""
+        chat_id = update.effective_chat.id
+        
+        with get_session() as session:
+            user = session.query(User).filter(User.chat_id == chat_id).first()
+            if not user:
+                await update.message.reply_text(TEXTS['not_registered'])
+                return
+            
+            user.paused = True
+            session.commit()
+        
+        await update.message.reply_text(TEXTS['notifications_paused'])
+
+    @rate_limit
+    async def resume_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /resume command"""
+        chat_id = update.effective_chat.id
+        
+        with get_session() as session:
+            user = session.query(User).filter(User.chat_id == chat_id).first()
+            if not user:
+                await update.message.reply_text(TEXTS['not_registered'])
+                return
+            
+            user.paused = False
+            session.commit()
+        
+        await update.message.reply_text(TEXTS['notifications_resumed'])
+
+    @rate_limit
+    async def delete_me_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /delete_me command"""
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(TEXTS['confirm_delete'], callback_data="confirm_delete"),
+                InlineKeyboardButton(TEXTS['cancel'], callback_data="cancel_delete")
+            ]
+        ])
+        
+        await update.message.reply_text(
+            TEXTS['confirm_data_deletion'],
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML
+        )
+
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /help command"""
+        await update.message.reply_text(TEXTS['help_message'], parse_mode=ParseMode.HTML)
+
+    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle all callback queries"""
+        query = update.callback_query
+        await query.answer()
+        
+        data = query.data
+        chat_id = query.message.chat_id
+        
+        # Store user context for multi-step processes
+        if not hasattr(context, 'user_data'):
+            context.user_data = {}
+        if chat_id not in context.user_data:
+            context.user_data[chat_id] = {}
+        
+        # Handle different callback types
+        if data.startswith("cat_"):
+            await self.handle_emotion_category_selection(query, context)
+        elif data.startswith("emo_"):
+            await self.handle_emotion_selection(query, context)
+        elif data.startswith("val_"):
+            await self.handle_valence_selection(query, context)
+        elif data.startswith("aro_"):
+            await self.handle_arousal_selection(query, context)
+        elif data.startswith("sum_"):
+            await self.handle_summary_request(query, context)
+        elif data.startswith("tz_"):
+            await self.handle_timezone_selection(query, context)
+        elif data == "confirm_delete":
+            await self.handle_data_deletion(query, context)
+        elif data == "cancel_delete":
+            await query.edit_message_text(TEXTS['deletion_cancelled'])
+        elif data == "skip_cause":
+            await self.handle_skip_cause(query, context)
+        elif data == "finish_entry":
+            await self.handle_finish_entry(query, context)
+
+    async def handle_emotion_category_selection(self, query, context):
+        """Handle emotion category selection"""
+        category_idx = int(query.data.replace("cat_", ""))
+        chat_id = query.message.chat_id
+        
+        # Get category by index
+        categories = list(EMOTION_CATEGORIES.keys())
+        if 0 <= category_idx < len(categories):
+            category = categories[category_idx]
+            context.user_data[chat_id]['selected_category'] = category
+            
+            # Show emotions in selected category
+            keyboard = self.get_emotions_keyboard(category)
+            
+            await query.edit_message_text(
+                f"{TEXTS['selected_category']} <b>{category}</b>\n\n{TEXTS['choose_specific_emotion']}",
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML
+            )
+
+    async def handle_emotion_selection(self, query, context):
+        """Handle specific emotion selection"""
+        emotion_data = query.data.replace("emo_", "")
+        chat_id = query.message.chat_id
+        
+        # Parse emotion data (category_idx:emotion_idx)
+        try:
+            cat_idx, emo_idx = map(int, emotion_data.split("_"))
+            categories = list(EMOTION_CATEGORIES.keys())
+            category = categories[cat_idx]
+            emotion = EMOTION_CATEGORIES[category]['emotions'][emo_idx]
+            
+            context.user_data[chat_id]['selected_emotion'] = emotion
+            
+            # Ask for valence (positive/negative)
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("😊 Приятная", callback_data="val_pos"),
+                    InlineKeyboardButton("😔 Неприятная", callback_data="val_neg"),
+                    InlineKeyboardButton("😐 Нейтральная", callback_data="val_neu")
+                ]
+            ])
+            
+            await query.edit_message_text(
+                f"{TEXTS['selected_emotion']} <b>{emotion}</b>\n\n{TEXTS['rate_valence']}",
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML
+            )
+        except (ValueError, IndexError):
+            await query.edit_message_text("Ошибка обработки выбора. Попробуйте снова.")
+
+    async def handle_valence_selection(self, query, context):
+        """Handle valence selection"""
+        valence_map = {"pos": "positive", "neg": "negative", "neu": "neutral"}
+        valence = valence_map.get(query.data.replace("val_", ""), "neutral")
+        chat_id = query.message.chat_id
+        
+        context.user_data[chat_id]['valence'] = valence
+        
+        # Ask for arousal (energy level)
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("⚡ Высокая", callback_data="aro_high"),
+                InlineKeyboardButton("🌊 Средняя", callback_data="aro_med"),
+                InlineKeyboardButton("😴 Низкая", callback_data="aro_low")
+            ]
+        ])
+        
+        valence_text = {
+            'positive': TEXTS['valence_positive'],
+            'negative': TEXTS['valence_negative'],
+            'neutral': TEXTS['valence_neutral']
         }
-    
-    def is_allowed(self, user_id: int, action_type: str = 'general_command') -> bool:
-        """
-        Check if user is allowed to perform action
         
-        Args:
-            user_id: User identifier
-            action_type: Type of action to check
-            
-        Returns:
-            True if allowed, False if rate limited
-        """
-        try:
-            if action_type not in self.limits:
-                action_type = 'general_command'
-            
-            limit_config = self.limits[action_type]
-            max_requests = limit_config['count']
-            time_window = limit_config['window']
-            
-            now = datetime.now()
-            user_key = f"{user_id}_{action_type}"
-            
-            # Clean old requests outside the time window
-            cutoff_time = now - timedelta(seconds=time_window)
-            requests_queue = self.user_requests[user_key]
-            
-            while requests_queue and requests_queue[0] < cutoff_time:
-                requests_queue.popleft()
-            
-            # Check if under limit
-            if len(requests_queue) >= max_requests:
-                return False
-            
-            # Add current request
-            requests_queue.append(now)
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error in rate limiter: {e}")
-            return True  # Allow on error to avoid blocking legitimate users
-    
-    def get_remaining_quota(self, user_id: int, action_type: str = 'general_command') -> int:
-        """
-        Get remaining quota for user action
+        await query.edit_message_text(
+            f"{TEXTS['selected_valence']} <b>{valence_text[valence]}</b>\n\n{TEXTS['rate_arousal']}",
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML
+        )
+
+    async def handle_arousal_selection(self, query, context):
+        """Handle arousal selection and ask for cause"""
+        arousal_map = {"high": "high", "med": "medium", "low": "low"}
+        arousal = arousal_map.get(query.data.replace("aro_", ""), "medium")
+        chat_id = query.message.chat_id
         
-        Args:
-            user_id: User identifier
-            action_type: Type of action to check
-            
-        Returns:
-            Number of remaining requests
-        """
-        try:
-            if action_type not in self.limits:
-                action_type = 'general_command'
-            
-            limit_config = self.limits[action_type]
-            max_requests = limit_config['count']
-            time_window = limit_config['window']
-            
-            now = datetime.now()
-            user_key = f"{user_id}_{action_type}"
-            
-            # Clean old requests
-            cutoff_time = now - timedelta(seconds=time_window)
-            requests_queue = self.user_requests[user_key]
-            
-            while requests_queue and requests_queue[0] < cutoff_time:
-                requests_queue.popleft()
-            
-            return max(0, max_requests - len(requests_queue))
-            
-        except Exception as e:
-            logger.error(f"Error getting remaining quota: {e}")
-            return 0
-    
-    def reset_user_limits(self, user_id: int):
-        """Reset all rate limits for a user"""
-        try:
-            keys_to_remove = [key for key in self.user_requests.keys() if key.startswith(f"{user_id}_")]
-            for key in keys_to_remove:
-                del self.user_requests[key]
-        except Exception as e:
-            logger.error(f"Error resetting user limits: {e}")
+        context.user_data[chat_id]['arousal'] = arousal
+        context.user_data[chat_id]['step'] = 'cause'
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(TEXTS['skip_cause_btn'], callback_data="skip_cause")]
+        ])
+        
+        arousal_text = {
+            'high': TEXTS['arousal_high'],
+            'medium': TEXTS['arousal_medium'],
+            'low': TEXTS['arousal_low']
+        }
+        
+        await query.edit_message_text(
+            f"{TEXTS['selected_arousal']} <b>{arousal_text[arousal]}</b>\n\n{TEXTS['ask_cause']}",
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML
+        )
 
-# Global rate limiter instance
-global_rate_limiter = RateLimiter()
+    async def handle_skip_cause(self, query, context):
+        """Handle skipping cause input"""
+        chat_id = query.message.chat_id
+        context.user_data[chat_id]['step'] = 'notes'
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(TEXTS['finish_entry_btn'], callback_data="finish_entry")]
+        ])
+        
+        await query.edit_message_text(
+            TEXTS['ask_additional_notes'],
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML
+        )
 
-def rate_limit(func: Callable = None, *, action_type: str = 'general_command', error_message: Optional[str] = None):
-    """
-    Decorator for rate limiting telegram bot handlers
-    
-    Args:
-        action_type: Type of action for rate limiting
-        error_message: Custom error message to send when rate limited
-    """
-    def decorator(func: Callable):
-        @functools.wraps(func)
-        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-            try:
-                # Get user ID safely
-                user_id = update.effective_user.id if update.effective_user else 0
-                
-                # Check rate limit
-                if not global_rate_limiter.is_allowed(user_id, action_type):
-                    # Log rate limit event
-                    logger.warning(f"Rate limit exceeded - User: {user_id}, Action: {action_type}")
+    async def handle_finish_entry(self, query, context):
+        """Finish emotion entry"""
+        chat_id = query.message.chat_id
+        user_data = context.user_data.get(chat_id, {})
+        
+        # Save entry to database
+        await self.save_emotion_entry(chat_id, user_data)
+        
+        # Clear user data
+        context.user_data[chat_id] = {}
+        
+        await query.edit_message_text(
+            TEXTS['entry_saved'],
+            parse_mode=ParseMode.HTML
+        )
+
+    async def handle_summary_request(self, query, context):
+        """Handle summary period selection"""
+        period = query.data.replace("sum_", "")
+        chat_id = query.message.chat_id
+        
+        with get_session() as session:
+            user = session.query(User).filter(User.chat_id == chat_id).first()
+            if not user:
+                await query.edit_message_text(TEXTS['not_registered'])
+                return
+            
+            # Generate summary
+            summary = await self.analyzer.generate_summary(user.id, period)
+            
+            # Add action buttons
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("📊 Другой период", callback_data="back_summary"),
+                    InlineKeyboardButton("💾 Экспорт", callback_data="export_data")
+                ]
+            ])
+            
+            await query.edit_message_text(
+                summary,
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML
+            )
+
+    async def handle_timezone_selection(self, query, context):
+        """Handle timezone selection"""
+        tz_idx = int(query.data.replace("tz_", ""))
+        chat_id = query.message.chat_id
+        
+        timezones = [
+            'Europe/Moscow', 'Europe/Kiev', 'Europe/Minsk', 
+            'Asia/Almaty', 'Asia/Tashkent', 'Europe/Berlin', 'America/New_York'
+        ]
+        
+        if 0 <= tz_idx < len(timezones):
+            timezone_str = timezones[tz_idx]
+            
+            with get_session() as session:
+                user = session.query(User).filter(User.chat_id == chat_id).first()
+                if user:
+                    user.timezone = timezone_str
+                    session.commit()
                     
-                    # Send error message
-                    message = error_message or "Слишком много запросов. Попробуйте через некоторое время."
-                    
-                    if update.message:
-                        await update.message.reply_text(message)
-                    elif update.callback_query:
-                        await update.callback_query.answer(message, show_alert=True)
-                    
-                    return
-                
-                # Execute original function
-                return await func(update, context, *args, **kwargs)
-                
-            except Exception as e:
-                logger.error(f"Error in rate limiter wrapper: {e}")
-                # Execute original function even if rate limiter fails
-                return await func(update, context, *args, **kwargs)
+                    await query.edit_message_text(
+                        f"{TEXTS['timezone_updated']} <b>{timezone_str}</b>",
+                        parse_mode=ParseMode.HTML
+                    )
+
+    async def handle_data_deletion(self, query, context):
+        """Handle confirmed data deletion"""
+        chat_id = query.message.chat_id
         
-        return wrapper
-    
-    # Handle both @rate_limit and @rate_limit() syntax
-    if func is None:
-        return decorator
-    else:
-        return decorator(func)
-
-# Specific decorators for different action types
-def rate_limit_emotion_entry(func: Callable):
-    """Rate limit for emotion entry actions"""
-    return rate_limit(func, action_type='emotion_entry', error_message="Слишком много записей эмоций. Попробуйте через некоторое время.")
-
-def rate_limit_summary(func: Callable):
-    """Rate limit for summary requests"""
-    return rate_limit(func, action_type='summary_request', error_message="Слишком много запросов сводок. Подождите немного.")
-
-def rate_limit_export(func: Callable):
-    """Rate limit for export requests"""
-    return rate_limit(func, action_type='export_request', error_message="Лимит экспорта превышен. Попробуйте позже.")
-
-def rate_limit_message(func: Callable):
-    """Rate limit for general messages"""
-    return rate_limit(func, action_type='message', error_message="Слишком много сообщений. Сделайте паузу.")
-
-async def check_user_quotas(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Command to check current rate limit quotas for user
-    """
-    user_id = update.effective_user.id
-    
-    quotas = {}
-    for action_type in ['emotion_entry', 'summary_request', 'export_request', 'general_command', 'message']:
-        remaining = global_rate_limiter.get_remaining_quota(user_id, action_type)
-        quotas[action_type] = remaining
-    
-    quota_text = "📊 <b>Ваши текущие лимиты:</b>\n\n"
-    quota_text += f"📝 Записи эмоций: {quotas['emotion_entry']}/50 в час\n"
-    quota_text += f"📈 Сводки: {quotas['summary_request']}/20 в час\n"
-    quota_text += f"💾 Экспорт: {quotas['export_request']}/5 в час\n"
-    quota_text += f"⌨️ Команды: {quotas['general_command']}/100 в час\n"
-    quota_text += f"💬 Сообщения: {quotas['message']}/200 в час\n"
-    
-    await update.message.reply_text(quota_text, parse_mode='HTML')
-
-def reset_user_rate_limits(user_id: int):
-    """Reset rate limits for specific user (admin function)"""
-    global_rate_limiter.reset_user_limits(user_id)
-    logger.info(f"Rate limits reset for user {user_id}")
-
-class RateLimitMiddleware:
-    """Middleware for additional rate limiting checks"""
-    
-    def __init__(self):
-        self.rate_limiter = global_rate_limiter
-    
-    async def process_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-        """
-        Process update through rate limiting middleware
+        with get_session() as session:
+            user = session.query(User).filter(User.chat_id == chat_id).first()
+            if user:
+                # Delete all user data
+                session.query(Entry).filter(Entry.user_id == user.id).delete()
+                session.query(Schedule).filter(Schedule.user_id == user.id).delete()
+                session.query(UserSettings).filter(UserSettings.user_id == user.id).delete()
+                session.delete(user)
+                session.commit()
         
-        Returns:
-            True if update should be processed, False if rate limited
-        """
+        await query.edit_message_text(TEXTS['data_deleted'])
+
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle text messages during emotion logging process"""
+        chat_id = update.effective_chat.id
+        message_text = sanitize_input(update.message.text)
+        
+        if not hasattr(context, 'user_data') or chat_id not in context.user_data:
+            await update.message.reply_text(TEXTS['no_active_session'])
+            return
+        
+        user_data = context.user_data[chat_id]
+        step = user_data.get('step')
+        
+        if step == 'cause':
+            user_data['cause'] = message_text
+            user_data['step'] = 'notes'
+            
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(TEXTS['finish_entry_btn'], callback_data="finish_entry")]
+            ])
+            
+            await update.message.reply_text(
+                TEXTS['ask_additional_notes'],
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML
+            )
+            
+        elif step == 'notes':
+            user_data['notes'] = message_text
+            
+            # Save entry
+            await self.save_emotion_entry(chat_id, user_data)
+            
+            # Clear user data
+            context.user_data[chat_id] = {}
+            
+            await update.message.reply_text(
+                TEXTS['entry_saved'],
+                parse_mode=ParseMode.HTML
+            )
+
+    async def save_emotion_entry(self, chat_id: int, user_data: Dict):
+        """Save emotion entry to database"""
+        with get_session() as session:
+            user = session.query(User).filter(User.chat_id == chat_id).first()
+            if not user:
+                return
+            
+            # Convert valence and arousal to numeric values
+            valence_map = {'positive': 1, 'neutral': 0, 'negative': -1}
+            arousal_map = {'high': 2, 'medium': 1, 'low': 0}
+            
+            entry = Entry(
+                user_id=user.id,
+                timestamp=datetime.now(timezone.utc),
+                emotions=json.dumps([user_data.get('selected_emotion', '')]),
+                category=user_data.get('selected_category', ''),
+                valence=valence_map.get(user_data.get('valence'), 0),
+                arousal=arousal_map.get(user_data.get('arousal'), 0),
+                cause=user_data.get('cause', ''),
+                notes=user_data.get('notes', '')
+            )
+            
+            session.add(entry)
+            session.commit()
+
+    def get_emotion_categories_keyboard(self) -> InlineKeyboardMarkup:
+        """Generate emotion categories keyboard with short callback data"""
+        buttons = []
+        categories = list(EMOTION_CATEGORIES.items())
+        
+        for idx, (category, info) in enumerate(categories):
+            buttons.append([InlineKeyboardButton(
+                f"{info['emoji']} {category}",
+                callback_data=f"cat_{idx}"
+            )])
+        
+        return InlineKeyboardMarkup(buttons)
+
+    def get_emotions_keyboard(self, category: str) -> InlineKeyboardMarkup:
+        """Generate emotions keyboard for specific category with short callback data"""
+        emotions = EMOTION_CATEGORIES[category]['emotions']
+        buttons = []
+        
+        categories = list(EMOTION_CATEGORIES.keys())
+        cat_idx = categories.index(category)
+        
+        # Create rows of 2 emotions each
+        for i in range(0, len(emotions), 2):
+            row = []
+            for j in range(i, min(i + 2, len(emotions))):
+                row.append(InlineKeyboardButton(
+                    emotions[j],
+                    callback_data=f"emo_{cat_idx}_{j}"
+                ))
+            buttons.append(row)
+        
+        # Add back button
+        buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_categories")])
+        
+        return InlineKeyboardMarkup(buttons)
+
+    def get_summary_period_keyboard(self) -> InlineKeyboardMarkup:
+        """Generate summary period selection keyboard"""
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📅 7 дней", callback_data="sum_7"),
+                InlineKeyboardButton("📊 14 дней", callback_data="sum_14")
+            ],
+            [
+                InlineKeyboardButton("📈 30 дней", callback_data="sum_30"),
+                InlineKeyboardButton("📉 90 дней", callback_data="sum_90")
+            ]
+        ])
+
+    def get_timezone_keyboard(self) -> InlineKeyboardMarkup:
+        """Generate timezone selection keyboard"""
+        timezones = [
+            ('Europe/Moscow', '🇷🇺 Москва (UTC+3)'),
+            ('Europe/Kiev', '🇺🇦 Киев (UTC+2)'),
+            ('Europe/Minsk', '🇧🇾 Минск (UTC+3)'),
+            ('Asia/Almaty', '🇰🇿 Алматы (UTC+6)'),
+            ('Asia/Tashkent', '🇺🇿 Ташкент (UTC+5)'),
+            ('Europe/Berlin', '🇩🇪 Берлин (UTC+1)'),
+            ('America/New_York', '🇺🇸 Нью-Йорк (UTC-5)'),
+        ]
+        
+        buttons = []
+        for idx, (tz_code, tz_name) in enumerate(timezones):
+            buttons.append([InlineKeyboardButton(
+                tz_name,
+                callback_data=f"tz_{idx}"
+            )])
+        
+        return InlineKeyboardMarkup(buttons)
+
+    async def send_daily_ping(self, chat_id: int):
+        """Send daily emotion check-in"""
+        with get_session() as session:
+            user = session.query(User).filter(User.chat_id == chat_id).first()
+            if not user or user.paused:
+                return
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✨ Записать эмоцию", callback_data="start_entry")],
+            [
+                InlineKeyboardButton("⏰ Отложить на 15 мин", callback_data="postpone_15"),
+                InlineKeyboardButton("🛑 Пропустить сегодня", callback_data="skip_today")
+            ]
+        ])
+        
         try:
-            user_id = update.effective_user.id if update.effective_user else 0
+            await self.app.bot.send_message(
+                chat_id=chat_id,
+                text=TEXTS['daily_ping'],
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML
+            )
+        except (BadRequest, Forbidden) as e:
+            logger.warning(f"Could not send daily ping to {chat_id}: {e}")
+
+    async def send_weekly_summary(self, chat_id: int):
+        """Send weekly emotional summary"""
+        with get_session() as session:
+            user = session.query(User).filter(User.chat_id == chat_id).first()
+            if not user or user.paused:
+                return
+        
+        try:
+            summary = await self.analyzer.generate_summary(user.id, "7")
             
-            # General message rate limiting
-            if not self.rate_limiter.is_allowed(user_id, 'message'):
-                logger.warning(f"Rate limit exceeded - User: {user_id}, Action: message")
-                return False
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📊 Подробная сводка", callback_data="sum_7")],
+                [InlineKeyboardButton("💾 Экспорт данных", callback_data="export_data")]
+            ])
             
-            # Additional checks for specific update types
-            if update.message and update.message.text:
-                # Basic spam detection
-                text = update.message.text.lower()
-                
-                # Check for excessive repetition
-                words = text.split()
-                if len(words) > 5:
-                    unique_words = set(words)
-                    if len(unique_words) / len(words) < 0.3:  # Less than 30% unique words
-                        logger.warning(f"Spam detected - User: {user_id}, Content: {text[:50]}")
-                        
-                        await update.message.reply_text(
-                            "Обнаружена подозрительная активность. Пожалуйста, используйте бот по назначению."
-                        )
-                        return False
-                
-                # Check for excessive caps
-                if len(text) > 10:
-                    caps_ratio = sum(1 for c in text if c.isupper()) / len(text)
-                    if caps_ratio > 0.7:  # More than 70% caps
-                        logger.warning(f"Excessive caps detected - User: {user_id}")
-                        
-                        await update.message.reply_text(
-                            "Пожалуйста, не используйте CAPS LOCK. Общайтесь спокойно."
-                        )
-                        return False
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error in rate limit middleware: {e}")
-            return True  # Allow processing on error
+            await self.app.bot.send_message(
+                chat_id=chat_id,
+                text=f"🌸 <b>Еженедельная сводка</b>\n\n{summary}",
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML
+            )
+        except (BadRequest, Forbidden) as e:
+            logger.warning(f"Could not send weekly summary to {chat_id}: {e}")
+
+    async def run_polling(self):
+        """Run bot with polling (for development)"""
+        await self.setup()
+        await self.app.run_polling(drop_pending_updates=True)
     
-    def get_user_stats(self, user_id: int) -> dict:
-        """Get rate limiting stats for user"""
-        stats = {}
-        for action_type in ['emotion_entry', 'summary_request', 'export_request', 'general_command', 'message']:
-            remaining = self.rate_limiter.get_remaining_quota(user_id, action_type)
-            limit_config = self.rate_limiter.limits[action_type]
-            stats[action_type] = {
-                'remaining': remaining,
-                'limit': limit_config['count'],
-                'window': limit_config['window']
-            }
-        return stats
+    async def shutdown(self):
+        """Shutdown bot properly"""
+        try:
+            if self.scheduler:
+                await self.scheduler.stop()
+            if self.app:
+                await self.app.shutdown()
+        except Exception as e:
+            logger.error(f"Error during shutdown: {e}")
 
-# Global middleware instance
-rate_limit_middleware = RateLimitMiddleware()
+# Health check endpoint for monitoring
+from aiohttp import web, web_runner
+import aiohttp_cors
 
-# Helper functions for debugging and monitoring
-def get_rate_limiter_stats() -> dict:
-    """Get overall rate limiter statistics"""
-    return {
-        'total_users_tracked': len(global_rate_limiter.user_requests),
-        'limits_configured': list(global_rate_limiter.limits.keys()),
-        'active_users': len([key for key in global_rate_limiter.user_requests.keys() if global_rate_limiter.user_requests[key]])
-    }
-
-def cleanup_old_rate_limit_data():
-    """Clean up old rate limit data (call periodically)"""
+async def health_check(request):
+    """Health check endpoint"""
     try:
-        now = datetime.now()
-        cutoff_time = now - timedelta(hours=2)  # Keep data for 2 hours max
+        # Check database connection
+        with get_session() as session:
+            session.execute(text("SELECT 1"))
         
-        keys_to_clean = []
-        for user_key, requests_queue in global_rate_limiter.user_requests.items():
-            # Clean old requests
-            while requests_queue and requests_queue[0] < cutoff_time:
-                requests_queue.popleft()
-            
-            # If queue is empty, mark for removal
-            if not requests_queue:
-                keys_to_clean.append(user_key)
+        # Check scheduler status  
+        scheduler_running = hasattr(bot, 'scheduler') and bot.scheduler.scheduler.running
         
-        # Remove empty queues
-        for key in keys_to_clean:
-            del global_rate_limiter.user_requests[key]
+        health_data = {
+            "status": "healthy",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "database": "connected",
+            "scheduler": "running" if scheduler_running else "stopped",
+            "version": "1.0.0"
+        }
         
-        logger.info(f"Cleaned up rate limit data: removed {len(keys_to_clean)} empty user queues")
-        
+        return web.json_response(health_data)
     except Exception as e:
-        logger.error(f"Error cleaning up rate limit data: {e}")
+        logger.error(f"Health check failed: {e}")
+        return web.json_response(
+            {"status": "unhealthy", "error": str(e)},
+            status=500
+        )
 
-# Export all necessary components
-__all__ = [
-    'rate_limit',
-    'rate_limit_emotion_entry', 
-    'rate_limit_summary',
-    'rate_limit_export',
-    'rate_limit_message',
-    'RateLimiter',
-    'global_rate_limiter',
-    'rate_limit_middleware',
-    'check_user_quotas',
-    'reset_user_rate_limits',
-    'get_rate_limiter_stats',
-    'cleanup_old_rate_limit_data'
-]
+async def root_handler(request):
+    """Root endpoint handler"""
+    return web.Response(text="Emotional Diary Bot is running! 🌸")
+
+async def webhook_handler(request):
+    """Handle incoming webhooks"""
+    try:
+        # Проверяем, что Application инициализирован
+        if not bot.app or not hasattr(bot.app, 'bot'):
+            logger.error("Application not properly initialized")
+            return web.Response(text="Application not initialized", status=500)
+        
+        update_data = await request.json()
+        update = Update.de_json(update_data, bot.app.bot)
+        
+        # Проверяем корректность update
+        if not update:
+            logger.error("Failed to parse update")
+            return web.Response(text="Invalid update", status=400)
+        
+        await bot.app.process_update(update)
+        return web.Response(text="OK")
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return web.Response(text=f"Error: {str(e)}", status=500)
+
+async def setup_web_server():
+    """Setup web server for webhooks and health checks"""
+    app = web.Application()
+    
+    # Setup CORS
+    cors = aiohttp_cors.setup(app, defaults={
+        "*": aiohttp_cors.ResourceOptions(
+            allow_credentials=True,
+            expose_headers="*",
+            allow_headers="*",
+            allow_methods="*"
+        )
+    })
+    
+    # Add routes
+    app.router.add_get('/', root_handler)
+    app.router.add_get('/health', health_check)
+    app.router.add_post('/webhook', webhook_handler)
+    
+    # Add CORS to all routes
+    for route in list(app.router.routes()):
+        cors.add(route)
+    
+    return app
+
+# Global bot instance
+bot = EmotionalDiaryBot()
+
+# Main execution
+if __name__ == "__main__":
+    
+    if WEBHOOK_URL:
+        async def main():
+            try:
+                logger.info("Starting bot setup...")
+                
+                # Setup bot
+                await bot.setup()
+                logger.info("Bot setup completed")
+                
+                # Setup web server
+                logger.info("Setting up web server...")
+                web_app = await setup_web_server()
+                runner = web_runner.AppRunner(web_app)
+                await runner.setup()
+                
+                site = web_runner.TCPSite(runner, '0.0.0.0', PORT)
+                await site.start()
+                logger.info(f"Web server started on port {PORT}")
+                
+                # Set webhook
+                webhook_url = f"{WEBHOOK_URL}/webhook"
+                logger.info(f"Setting webhook to: {webhook_url}")
+                
+                webhook_info = await bot.app.bot.set_webhook(
+                    url=webhook_url,
+                    drop_pending_updates=True
+                )
+                
+                if webhook_info:
+                    logger.info("Webhook set successfully")
+                else:
+                    logger.error("Failed to set webhook")
+                
+                logger.info(f"Bot started with webhook on port {PORT}")
+                logger.info(f"Webhook URL set to: {webhook_url}")
+                logger.info(f"Health check available at: {WEBHOOK_URL}/health")
+                logger.info(f"Root endpoint available at: {WEBHOOK_URL}/")
+                
+                # Keep running
+                try:
+                    while True:
+                        await asyncio.sleep(1)
+                except KeyboardInterrupt:
+                    logger.info("Shutting down...")
+                    await bot.shutdown()
+                    await runner.cleanup()
+                    
+            except Exception as e:
+                logger.error(f"Error in main: {e}")
+                import traceback
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                await bot.shutdown()
+                raise
+        
+        asyncio.run(main())
+    else:
+        logger.info("No WEBHOOK_URL provided, running in polling mode")
+        asyncio.run(bot.run_polling())
