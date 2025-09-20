@@ -10,6 +10,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden
+from sqlalchemy import text  # Добавлен импорт для SQLAlchemy 2.0
 
 from db import init_db, User, Entry, Schedule, UserSettings, get_session
 from scheduler import EmotionScheduler
@@ -635,9 +636,10 @@ import aiohttp_cors
 async def health_check(request):
     """Health check endpoint"""
     try:
-        # Check database connection
+        # Check database connection - ИСПРАВЛЕНО для SQLAlchemy 2.0
+        from sqlalchemy import text
         with get_session() as session:
-            session.execute("SELECT 1")
+            session.execute(text("SELECT 1"))
         
         # Check scheduler status  
         scheduler_running = hasattr(bot, 'scheduler') and bot.scheduler.scheduler.running
