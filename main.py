@@ -5,6 +5,7 @@ import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, List
 import json
+import hashlib
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -88,6 +89,15 @@ class EmotionalDiaryBot:
         await self.scheduler.start()
         
         logger.info("Bot setup completed")
+
+    def _create_short_callback_data(self, data: str) -> str:
+        """Create short callback data using hash for long strings"""
+        if len(data) <= 64:  # Telegram limit
+            return data
+        
+        # Create hash for long data
+        hash_obj = hashlib.md5(data.encode())
+        return f"h_{hash_obj.hexdigest()[:10]}"
 
     @rate_limit
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -270,17 +280,17 @@ class EmotionalDiaryBot:
             context.user_data[chat_id] = {}
         
         # Handle different callback types
-        if data.startswith("emotion_category_"):
+        if data.startswith("cat_"):
             await self.handle_emotion_category_selection(query, context)
-        elif data.startswith("emotion_"):
+        elif data.startswith("emo_"):
             await self.handle_emotion_selection(query, context)
-        elif data.startswith("valence_"):
+        elif data.startswith("val_"):
             await self.handle_valence_selection(query, context)
-        elif data.startswith("arousal_"):
+        elif data.startswith("aro_"):
             await self.handle_arousal_selection(query, context)
-        elif data.startswith("summary_"):
+        elif data.startswith("sum_"):
             await self.handle_summary_request(query, context)
-        elif data.startswith("timezone_"):
+        elif data.startswith("tz_"):
             await self.handle_timezone_selection(query, context)
         elif data == "confirm_delete":
             await self.handle_data_deletion(query, context)
@@ -293,45 +303,59 @@ class EmotionalDiaryBot:
 
     async def handle_emotion_category_selection(self, query, context):
         """Handle emotion category selection"""
-        category = query.data.replace("emotion_category_", "")
+        category_idx = int(query.data.replace("cat_", ""))
         chat_id = query.message.chat_id
         
-        context.user_data[chat_id]['selected_category'] = category
-        
-        # Show emotions in selected category
-        keyboard = self.get_emotions_keyboard(category)
-        
-        await query.edit_message_text(
-            f"{TEXTS['selected_category']} <b>{category}</b>\n\n{TEXTS['choose_specific_emotion']}",
-            reply_markup=keyboard,
-            parse_mode=ParseMode.HTML
-        )
+        # Get category by index
+        categories = list(EMOTION_CATEGORIES.keys())
+        if 0 <= category_idx < len(categories):
+            category = categories[category_idx]
+            context.user_data[chat_id]['selected_category'] = category
+            
+            # Show emotions in selected category
+            keyboard = self.get_emotions_keyboard(category)
+            
+            await query.edit_message_text(
+                f"{TEXTS['selected_category']} <b>{category}</b>\n\n{TEXTS['choose_specific_emotion']}",
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML
+            )
 
     async def handle_emotion_selection(self, query, context):
         """Handle specific emotion selection"""
-        emotion = query.data.replace("emotion_", "")
+        emotion_data = query.data.replace("emo_", "")
         chat_id = query.message.chat_id
         
-        context.user_data[chat_id]['selected_emotion'] = emotion
-        
-        # Ask for valence (positive/negative)
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("😊 Приятная", callback_data="valence_positive"),
-                InlineKeyboardButton("😔 Неприятная", callback_data="valence_negative"),
-                InlineKeyboardButton("😐 Нейтральная", callback_data="valence_neutral")
-            ]
-        ])
-        
-        await query.edit_message_text(
-            f"{TEXTS['selected_emotion']} <b>{emotion}</b>\n\n{TEXTS['rate_valence']}",
-            reply_markup=keyboard,
-            parse_mode=ParseMode.HTML
-        )
+        # Parse emotion data (category_idx:emotion_idx)
+        try:
+            cat_idx, emo_idx = map(int, emotion_data.split("_"))
+            categories = list(EMOTION_CATEGORIES.keys())
+            category = categories[cat_idx]
+            emotion = EMOTION_CATEGORIES[category]['emotions'][emo_idx]
+            
+            context.user_data[chat_id]['selected_emotion'] = emotion
+            
+            # Ask for valence (positive/negative)
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("😊 Приятная", callback_data="val_pos"),
+                    InlineKeyboardButton("😔 Неприятная", callback_data="val_neg"),
+                    InlineKeyboardButton("😐 Нейтральная", callback_data="val_neu")
+                ]
+            ])
+            
+            await query.edit_message_text(
+                f"{TEXTS['selected_emotion']} <b>{emotion}</b>\n\n{TEXTS['rate_valence']}",
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML
+            )
+        except (ValueError, IndexError):
+            await query.edit_message_text("Ошибка обработки выбора. Попробуйте снова.")
 
     async def handle_valence_selection(self, query, context):
         """Handle valence selection"""
-        valence = query.data.replace("valence_", "")
+        valence_map = {"pos": "positive", "neg": "negative", "neu": "neutral"}
+        valence = valence_map.get(query.data.replace("val_", ""), "neutral")
         chat_id = query.message.chat_id
         
         context.user_data[chat_id]['valence'] = valence
@@ -339,9 +363,9 @@ class EmotionalDiaryBot:
         # Ask for arousal (energy level)
         keyboard = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("⚡ Высокая", callback_data="arousal_high"),
-                InlineKeyboardButton("🌊 Средняя", callback_data="arousal_medium"),
-                InlineKeyboardButton("😴 Низкая", callback_data="arousal_low")
+                InlineKeyboardButton("⚡ Высокая", callback_data="aro_high"),
+                InlineKeyboardButton("🌊 Средняя", callback_data="aro_med"),
+                InlineKeyboardButton("😴 Низкая", callback_data="aro_low")
             ]
         ])
         
@@ -359,7 +383,8 @@ class EmotionalDiaryBot:
 
     async def handle_arousal_selection(self, query, context):
         """Handle arousal selection and ask for cause"""
-        arousal = query.data.replace("arousal_", "")
+        arousal_map = {"high": "high", "med": "medium", "low": "low"}
+        arousal = arousal_map.get(query.data.replace("aro_", ""), "medium")
         chat_id = query.message.chat_id
         
         context.user_data[chat_id]['arousal'] = arousal
@@ -414,7 +439,7 @@ class EmotionalDiaryBot:
 
     async def handle_summary_request(self, query, context):
         """Handle summary period selection"""
-        period = query.data.replace("summary_", "")
+        period = query.data.replace("sum_", "")
         chat_id = query.message.chat_id
         
         with get_session() as session:
@@ -429,7 +454,7 @@ class EmotionalDiaryBot:
             # Add action buttons
             keyboard = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("📊 Другой период", callback_data="back_to_summary"),
+                    InlineKeyboardButton("📊 Другой период", callback_data="back_summary"),
                     InlineKeyboardButton("💾 Экспорт", callback_data="export_data")
                 ]
             ])
@@ -442,19 +467,27 @@ class EmotionalDiaryBot:
 
     async def handle_timezone_selection(self, query, context):
         """Handle timezone selection"""
-        timezone_str = query.data.replace("timezone_", "").replace("_", "/")
+        tz_idx = int(query.data.replace("tz_", ""))
         chat_id = query.message.chat_id
         
-        with get_session() as session:
-            user = session.query(User).filter(User.chat_id == chat_id).first()
-            if user:
-                user.timezone = timezone_str
-                session.commit()
-                
-                await query.edit_message_text(
-                    f"{TEXTS['timezone_updated']} <b>{timezone_str}</b>",
-                    parse_mode=ParseMode.HTML
-                )
+        timezones = [
+            'Europe/Moscow', 'Europe/Kiev', 'Europe/Minsk', 
+            'Asia/Almaty', 'Asia/Tashkent', 'Europe/Berlin', 'America/New_York'
+        ]
+        
+        if 0 <= tz_idx < len(timezones):
+            timezone_str = timezones[tz_idx]
+            
+            with get_session() as session:
+                user = session.query(User).filter(User.chat_id == chat_id).first()
+                if user:
+                    user.timezone = timezone_str
+                    session.commit()
+                    
+                    await query.edit_message_text(
+                        f"{TEXTS['timezone_updated']} <b>{timezone_str}</b>",
+                        parse_mode=ParseMode.HTML
+                    )
 
     async def handle_data_deletion(self, query, context):
         """Handle confirmed data deletion"""
@@ -538,20 +571,25 @@ class EmotionalDiaryBot:
             session.commit()
 
     def get_emotion_categories_keyboard(self) -> InlineKeyboardMarkup:
-        """Generate emotion categories keyboard"""
+        """Generate emotion categories keyboard with short callback data"""
         buttons = []
-        for category, info in EMOTION_CATEGORIES.items():
+        categories = list(EMOTION_CATEGORIES.items())
+        
+        for idx, (category, info) in enumerate(categories):
             buttons.append([InlineKeyboardButton(
                 f"{info['emoji']} {category}",
-                callback_data=f"emotion_category_{category}"
+                callback_data=f"cat_{idx}"
             )])
         
         return InlineKeyboardMarkup(buttons)
 
     def get_emotions_keyboard(self, category: str) -> InlineKeyboardMarkup:
-        """Generate emotions keyboard for specific category"""
+        """Generate emotions keyboard for specific category with short callback data"""
         emotions = EMOTION_CATEGORIES[category]['emotions']
         buttons = []
+        
+        categories = list(EMOTION_CATEGORIES.keys())
+        cat_idx = categories.index(category)
         
         # Create rows of 2 emotions each
         for i in range(0, len(emotions), 2):
@@ -559,12 +597,12 @@ class EmotionalDiaryBot:
             for j in range(i, min(i + 2, len(emotions))):
                 row.append(InlineKeyboardButton(
                     emotions[j],
-                    callback_data=f"emotion_{emotions[j]}"
+                    callback_data=f"emo_{cat_idx}_{j}"
                 ))
             buttons.append(row)
         
         # Add back button
-        buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_categories")])
+        buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_categories")])
         
         return InlineKeyboardMarkup(buttons)
 
@@ -572,12 +610,12 @@ class EmotionalDiaryBot:
         """Generate summary period selection keyboard"""
         return InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("📅 7 дней", callback_data="summary_7"),
-                InlineKeyboardButton("📊 14 дней", callback_data="summary_14")
+                InlineKeyboardButton("📅 7 дней", callback_data="sum_7"),
+                InlineKeyboardButton("📊 14 дней", callback_data="sum_14")
             ],
             [
-                InlineKeyboardButton("📈 30 дней", callback_data="summary_30"),
-                InlineKeyboardButton("📉 90 дней", callback_data="summary_90")
+                InlineKeyboardButton("📈 30 дней", callback_data="sum_30"),
+                InlineKeyboardButton("📉 90 дней", callback_data="sum_90")
             ]
         ])
 
@@ -594,10 +632,10 @@ class EmotionalDiaryBot:
         ]
         
         buttons = []
-        for tz_code, tz_name in timezones:
+        for idx, (tz_code, tz_name) in enumerate(timezones):
             buttons.append([InlineKeyboardButton(
                 tz_name,
-                callback_data=f"timezone_{tz_code.replace('/', '_')}"
+                callback_data=f"tz_{idx}"
             )])
         
         return InlineKeyboardMarkup(buttons)
@@ -638,7 +676,7 @@ class EmotionalDiaryBot:
             summary = await self.analyzer.generate_summary(user.id, "7")
             
             keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📊 Подробная сводка", callback_data="summary_7")],
+                [InlineKeyboardButton("📊 Подробная сводка", callback_data="sum_7")],
                 [InlineKeyboardButton("💾 Экспорт данных", callback_data="export_data")]
             ])
             
