@@ -1,6 +1,6 @@
 # db.py
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta  # ИСПРАВЛЕНО: добавлен timedelta
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Text, Float, ForeignKey, JSON
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
