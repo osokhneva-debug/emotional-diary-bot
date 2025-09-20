@@ -31,8 +31,14 @@ BOT_TOKEN = os.getenv('BOT_TOKEN') or os.getenv('TELEGRAM_BOT_TOKEN')
 if not BOT_TOKEN:
     raise ValueError("Bot token not found. Set BOT_TOKEN or TELEGRAM_BOT_TOKEN environment variable")
 
+# Debug токена (скрыть последние символы)
+logger.info(f"Bot token loaded: {BOT_TOKEN[:20]}...{BOT_TOKEN[-10:]}")
+
 WEBHOOK_URL = os.getenv('WEBHOOK_URL')
 PORT = int(os.getenv('PORT', 8080))
+
+logger.info(f"Webhook URL: {WEBHOOK_URL}")
+logger.info(f"Port: {PORT}")
 
 class EmotionalDiaryBot:
     def __init__(self):
@@ -47,7 +53,12 @@ class EmotionalDiaryBot:
         self.app = Application.builder().token(BOT_TOKEN).build()
         
         # ВАЖНО: Инициализируем Application
-        await self.app.initialize()
+        try:
+            await self.app.initialize()
+            logger.info("Application initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize application: {e}")
+            raise
         
         # Command handlers
         self.app.add_handler(CommandHandler("start", self.start_command))
@@ -676,13 +687,24 @@ async def health_check(request):
 async def webhook_handler(request):
     """Handle incoming webhooks"""
     try:
+        # Проверяем, что Application инициализирован
+        if not bot.app or not hasattr(bot.app, 'bot'):
+            logger.error("Application not properly initialized")
+            return web.Response(text="Application not initialized", status=500)
+        
         update_data = await request.json()
         update = Update.de_json(update_data, bot.app.bot)
+        
+        # Проверяем корректность update
+        if not update:
+            logger.error("Failed to parse update")
+            return web.Response(text="Invalid update", status=400)
+        
         await bot.app.process_update(update)
         return web.Response(text="OK")
     except Exception as e:
         logger.error(f"Webhook error: {e}")
-        return web.Response(text="Error", status=500)
+        return web.Response(text=f"Error: {str(e)}", status=500)
 
 async def setup_web_server():
     """Setup web server for webhooks and health checks"""
@@ -716,23 +738,35 @@ if __name__ == "__main__":
     if WEBHOOK_URL:
         async def main():
             try:
+                logger.info("Starting bot setup...")
+                
                 # Setup bot
                 await bot.setup()
+                logger.info("Bot setup completed")
                 
                 # Setup web server
+                logger.info("Setting up web server...")
                 web_app = await setup_web_server()
                 runner = web_runner.AppRunner(web_app)
                 await runner.setup()
                 
                 site = web_runner.TCPSite(runner, '0.0.0.0', PORT)
                 await site.start()
+                logger.info(f"Web server started on port {PORT}")
                 
                 # Set webhook
                 webhook_url = f"{WEBHOOK_URL}/webhook"
-                await bot.app.bot.set_webhook(
+                logger.info(f"Setting webhook to: {webhook_url}")
+                
+                webhook_info = await bot.app.bot.set_webhook(
                     url=webhook_url,
                     drop_pending_updates=True
                 )
+                
+                if webhook_info:
+                    logger.info("Webhook set successfully")
+                else:
+                    logger.error("Failed to set webhook")
                 
                 logger.info(f"Bot started with webhook on port {PORT}")
                 logger.info(f"Webhook URL set to: {webhook_url}")
@@ -750,6 +784,8 @@ if __name__ == "__main__":
                     
             except Exception as e:
                 logger.error(f"Error in main: {e}")
+                import traceback
+                logger.error(f"Traceback: {traceback.format_exc()}")
                 await bot.shutdown()
                 raise
         
